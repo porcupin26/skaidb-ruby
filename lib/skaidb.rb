@@ -628,6 +628,72 @@ module Skaidb
       parse_response(reader).cmd_tuples
     end
 
+    # Stream a result set: yields one row Hash at a time while holding a
+    # single chunk, instead of buffering the whole result. For exports and
+    # large scans.
+    #
+    #   conn.stream("SELECT ...") { |row| puts row["id"] }
+    #
+    # The connection is busy until the stream ends; breaking out of the block
+    # drains the remaining frames so the connection stays usable. Takes no
+    # parameters — the streaming opcode carries SQL text.
+    def stream(sql, consistency: nil)
+      return enum_for(:stream, sql, consistency: consistency) unless block_given?
+      raise ConnectionError, "connection is closed" if @closed
+
+      level = consistency.nil? ? @consistency : Consistency.resolve(consistency)
+      sql_bytes = sql.dup.force_encoding("UTF-8").b
+      req = [5, level].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
+      live = false
+      @mutex.synchronize do
+        write_frame(req)
+        r = Reader.new(read_frame)
+        tag = r.u8
+        case tag
+        when 3
+          msg = r.text
+          raise QueryError, msg.include?("unknown opcode") ? "server does not support streaming: #{msg}" : msg
+        when 1, 2
+          return nil # not row-producing
+        when 5
+          cols = Array.new(r.u32) { r.text }
+          live = true
+          begin
+            while live
+              fr = Reader.new(read_frame)
+              case fr.u8
+              when 6
+                fr.u32.times do
+                  ncells = fr.u32
+                  cells = Array.new(ncells) { Skaidb.decode_value(Reader.new(fr.blob)) }
+                  yield cols.zip(cells).to_h
+                end
+              when 7
+                live = false
+              when 3
+                live = false
+                raise QueryError, fr.text
+              else
+                live = false
+                raise QueryError, "unexpected frame in stream"
+              end
+            end
+          ensure
+            # Abandoned early: drain so leftovers are not read as the reply
+            # to the next statement.
+            while live
+              fr = Reader.new(read_frame)
+              t = fr.u8
+              live = false if t == 7 || t == 3
+            end
+          end
+        else
+          raise QueryError, "unexpected response tag #{tag} to stream request"
+        end
+      end
+      nil
+    end
+
     # Prepare +sql+ on the SERVER, returning [id, nparams], or nil when the
     # server declines the statement kind (DDL, session statements) so the
     # caller falls back to text binding. Cached per connection.
