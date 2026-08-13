@@ -63,7 +63,19 @@ conn.close
 
 `Result` is `Enumerable`, so `map`, `select`, `to_a`, etc. all work.
 
-### Consistency
+### TLS and database
+
+```ruby
+Skaidb.connect(host: "db1", user: "u", password: "p",
+               database: "app",                       # USE app on connect
+               tls_ca: "/etc/skaidb/skai-ca.crt")     # or tls_insecure: true (dev)
+```
+
+A server with `client_tls = required` refuses plaintext, so one of the TLS
+options is mandatory there. `tls_server_name` (default `skaidb`) must match a
+SAN on the server certificate — usually *not* the address you dialled.
+
+## Consistency
 
 skaidb is leaderless with tunable consistency. Default is `:quorum`:
 

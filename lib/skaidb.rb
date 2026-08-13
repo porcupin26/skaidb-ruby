@@ -399,13 +399,16 @@ module Skaidb
     # @return [Boolean] whether the connection has been closed
     attr_reader :closed
 
-    def initialize(host:, port:, user:, password:, consistency:, timeout:)
+    def initialize(host:, port:, user:, password:, consistency:, timeout:,
+                   database: nil, tls: false, tls_ca: nil, tls_insecure: false,
+                   tls_server_name: "skaidb")
       @consistency = Consistency.resolve(consistency)
       @mutex = Mutex.new
       @closed = false
       begin
         @sock = Socket.tcp(host, port, connect_timeout: timeout)
         @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+        @sock = tls_wrap(@sock, tls_ca, tls_insecure, tls_server_name) if tls
       rescue StandardError => e
         raise ConnectionError, "connect failed: #{e.message}"
       end
@@ -415,6 +418,33 @@ module Skaidb
         close
         raise
       end
+      # USE is per-connection session state, so it runs on every dial.
+      exec(%(USE "#{database.to_s.gsub('"', '""')}")) if database && !database.to_s.empty?
+    end
+
+    # Upgrade a connected socket to TLS. A server with client_tls = required
+    # refuses plaintext outright, so without this such a cluster is simply
+    # unreachable. +tls_server_name+ must match a SAN on the server
+    # certificate — skaidb's own certs carry DNS:skaidb, which is usually NOT
+    # the address dialled.
+    def tls_wrap(sock, ca_file, insecure, server_name)
+      ctx = OpenSSL::SSL::SSLContext.new
+      if insecure
+        # Encrypts, but authenticates nothing: a man in the middle can present
+        # any certificate. Development only.
+        ctx.verify_mode = OpenSSL::SSL::VERIFY_NONE
+      else
+        ctx.verify_mode = OpenSSL::SSL::VERIFY_PEER
+        ctx.cert_store = OpenSSL::X509::Store.new.tap do |store|
+          ca_file && !ca_file.empty? ? store.add_file(ca_file) : store.set_default_paths
+        end
+      end
+      ssl = OpenSSL::SSL::SSLSocket.new(sock, ctx)
+      ssl.hostname = server_name          # SNI
+      ssl.sync_close = true
+      ssl.connect
+      ssl.post_connection_check(server_name) unless insecure
+      ssl
     end
 
     # Current default consistency level (0/1/2).
@@ -580,10 +610,15 @@ module Skaidb
   # @yield [conn] optional block; the connection is closed when it returns
   # @return [Connection] (or the block's value when a block is given)
   def self.connect(host: "localhost", port: 7000, user: "anonymous",
-                   password: "", consistency: :quorum, timeout: 10.0)
+                   password: "", consistency: :quorum, timeout: 10.0,
+                   database: nil, tls: false, tls_ca: nil, tls_insecure: false,
+                   tls_server_name: "skaidb")
+    tls = true if tls_ca || tls_insecure
     conn = Connection.new(host: host, port: port, user: user,
                           password: password, consistency: consistency,
-                          timeout: timeout)
+                          timeout: timeout, database: database, tls: tls,
+                          tls_ca: tls_ca, tls_insecure: tls_insecure,
+                          tls_server_name: tls_server_name)
     return conn unless block_given?
 
     begin
