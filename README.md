@@ -63,6 +63,14 @@ conn.close
 
 `Result` is `Enumerable`, so `map`, `select`, `to_a`, etc. all work.
 
+### Failover
+
+```ruby
+Skaidb.connect(seeds: ["db1:7000", "db2:7000"], user: "u", password: "p")
+```
+
+Tried in shuffled order until one connects and authenticates.
+
 ### TLS and database
 
 ```ruby

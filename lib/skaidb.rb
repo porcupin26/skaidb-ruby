@@ -489,23 +489,42 @@ module Skaidb
 
     def initialize(host:, port:, user:, password:, consistency:, timeout:,
                    database: nil, tls: false, tls_ca: nil, tls_insecure: false,
-                   tls_server_name: "skaidb")
+                   tls_server_name: "skaidb", seeds: nil)
       @consistency = Consistency.resolve(consistency)
       @mutex = Mutex.new
       @closed = false
       @prepared = {}
-      begin
-        @sock = Socket.tcp(host, port, connect_timeout: timeout)
-        @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
-        @sock = tls_wrap(@sock, tls_ca, tls_insecure, tls_server_name) if tls
-      rescue StandardError => e
-        raise ConnectionError, "connect failed: #{e.message}"
+      # Seeds: try each until one connects AND authenticates — a node that
+      # accepts TCP while unhealthy must not swallow the attempt. skaidb is
+      # leaderless, so any node serves; the order is shuffled so many
+      # clients spread instead of stampeding the first entry.
+      endpoints = (seeds && !seeds.empty? ? seeds : ["#{host}:#{port}"]).map do |sd|
+        h, _, p = sd.to_s.rpartition(":")
+        h.empty? ? [sd.to_s, port] : [h, p.to_i]
+      end.shuffle
+      last = nil
+      endpoints.each do |(h, prt)|
+        begin
+          @sock = Socket.tcp(h, prt, connect_timeout: timeout)
+          @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+          @sock = tls_wrap(@sock, tls_ca, tls_insecure, tls_server_name) if tls
+          handshake(user.to_s, password.to_s)
+          last = nil
+          break
+        rescue StandardError => e
+          last = e
+          begin
+            @sock&.close
+          rescue StandardError
+            nil
+          end
+          @sock = nil
+        end
       end
-      begin
-        handshake(user.to_s, password.to_s)
-      rescue ConnectionError
-        close
-        raise
+      if last
+        @closed = true
+        raise ConnectionError,
+              "no reachable endpoint in #{endpoints.map { |(h, q)| "#{h}:#{q}" }.join(', ')}: #{last.message}"
       end
       # USE is per-connection session state, so it runs on every dial.
       exec(%(USE "#{database.to_s.gsub('"', '""')}")) if database && !database.to_s.empty?
@@ -798,13 +817,13 @@ module Skaidb
   def self.connect(host: "localhost", port: 7000, user: "anonymous",
                    password: "", consistency: :quorum, timeout: 10.0,
                    database: nil, tls: false, tls_ca: nil, tls_insecure: false,
-                   tls_server_name: "skaidb")
+                   tls_server_name: "skaidb", seeds: nil)
     tls = true if tls_ca || tls_insecure
     conn = Connection.new(host: host, port: port, user: user,
                           password: password, consistency: consistency,
                           timeout: timeout, database: database, tls: tls,
                           tls_ca: tls_ca, tls_insecure: tls_insecure,
-                          tls_server_name: tls_server_name)
+                          tls_server_name: tls_server_name, seeds: seeds)
     return conn unless block_given?
 
     begin
