@@ -575,6 +575,40 @@ module Skaidb
       run(Skaidb.bind(sql.to_s, params), level)
     end
 
+    # Execute +sql+ once per row in ONE round-trip. Rows autocommit
+    # individually: a failure names the row and earlier rows stay applied,
+    # so the statement must be idempotent. Returns total affected rows.
+    def exec_batch(sql, rows, consistency: nil)
+      return 0 if rows.nil? || rows.empty?
+
+      level = consistency.nil? ? @consistency : Consistency.resolve(consistency)
+      qsql, = Skaidb.to_qmark(sql.to_s, rows.first)
+      prep = prepare_server(qsql)
+      raise QueryError, "statement cannot be prepared, so it cannot be batched" if prep.nil?
+
+      id, nparams = prep
+      ordered = rows.map { |r| Skaidb.to_qmark(sql.to_s, r)[1] }
+      ordered.each do |r|
+        raise QueryError, "batch row expects #{nparams} parameters, got #{r.length}" if r.length != nparams
+      end
+      raise ConnectionError, "connection is closed" if @closed
+
+      req = +([7, level].pack("CC") + [id].pack("V") + [ordered.length].pack("V"))
+      ordered.each do |r|
+        req << [r.length].pack("v")
+        r.each do |v|
+          b = Skaidb.encode_value(v)
+          req << [b.bytesize].pack("V") << b
+        end
+      end
+      reader = nil
+      @mutex.synchronize do
+        write_frame(req)
+        reader = Reader.new(read_frame)
+      end
+      parse_response(reader).cmd_tuples
+    end
+
     # Prepare +sql+ on the SERVER, returning [id, nparams], or nil when the
     # server declines the statement kind (DDL, session statements) so the
     # caller falls back to text binding. Cached per connection.
