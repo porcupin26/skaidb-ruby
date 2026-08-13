@@ -107,6 +107,10 @@ module Skaidb
       take(1).unpack1("C")
     end
 
+    def u16
+      take(2).unpack1("v")
+    end
+
     def u32
       take(4).unpack1("V")
     end
@@ -220,6 +224,90 @@ module Skaidb
 
   # Interpolate +params+ into +sql+, replacing $1, $2, ... placeholders that
   # appear outside single-quoted string literals.
+  # Rewrite pg-style +$N+ placeholders to the positional +?+ the server's
+  # prepared statements use, returning [sql, params_in_wire_order]. A
+  # parameter referenced twice is sent twice — +?+ is positional and cannot
+  # say "the same one again". +$N+ inside a string literal is left alone.
+  def self.to_qmark(sql, params)
+    params ||= []
+    out = +""
+    order = []
+    in_str = false
+    i = 0
+    n = sql.length
+    while i < n
+      ch = sql[i]
+      if in_str
+        out << ch
+        if ch == "'"
+          if i + 1 < n && sql[i + 1] == "'"
+            out << "'"
+            i += 2
+            next
+          end
+          in_str = false
+        end
+        i += 1
+        next
+      end
+      if ch == "'"
+        in_str = true
+        out << ch
+        i += 1
+        next
+      end
+      if ch == "$" && i + 1 < n && sql[i + 1] =~ /[0-9]/
+        j = i + 1
+        j += 1 while j < n && sql[j] =~ /[0-9]/
+        idx = sql[(i + 1)...j].to_i
+        raise QueryError, "invalid placeholder $0" if idx < 1
+        raise QueryError, "placeholder $#{idx} has no parameter" if idx > params.length
+
+        order << params[idx - 1]
+        out << "?"
+        i = j
+        next
+      end
+      out << ch
+      i += 1
+    end
+    [out, order]
+  end
+
+  # Encode a Ruby value as a TYPED skaidb value (tag + payload), the inverse
+  # of decode_value. Arrays become Array and Hashes become Document — the
+  # point of the prepared path, since neither has a SQL literal form.
+  def self.encode_value(v)
+    case v
+    when nil then [0].pack("C")
+    when true then [1, 1].pack("CC")
+    when false then [1, 0].pack("CC")
+    when Integer then [2].pack("C") + [v].pack("q<")
+    when Float
+      raise QueryError, "cannot bind NaN/Infinity" if v.nan? || v.infinite?
+
+      [3].pack("C") + [v].pack("E")
+    when String
+      b = v.dup.force_encoding(Encoding::BINARY)
+      [5].pack("C") + [b.bytesize].pack("V") + b
+    when Time
+      [8].pack("C") + [(v.to_f * 1000).round].pack("q<")
+    when Array
+      out = +([9].pack("C") + [v.length].pack("V"))
+      v.each { |item| out << encode_value(item) }
+      out
+    when Hash
+      out = +([10].pack("C") + [v.length].pack("V"))
+      v.each do |k, val|
+        ks = k.to_s.dup.force_encoding(Encoding::BINARY)
+        out << [ks.bytesize].pack("V") << ks << encode_value(val)
+      end
+      out
+    else
+      raise QueryError, "cannot bind value of type #{v.class}"
+    end
+  end
+
   def self.bind(sql, params)
     params ||= []
     out = +""
@@ -405,6 +493,7 @@ module Skaidb
       @consistency = Consistency.resolve(consistency)
       @mutex = Mutex.new
       @closed = false
+      @prepared = {}
       begin
         @sock = Socket.tcp(host, port, connect_timeout: timeout)
         @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
@@ -466,9 +555,72 @@ module Skaidb
     # @param params [Array] positional parameters
     # @return [Result]
     def exec_params(sql, params = [], consistency: nil)
-      bound = Skaidb.bind(sql.to_s, params)
       level = consistency.nil? ? @consistency : Consistency.resolve(consistency)
-      run(bound, level)
+      params ||= []
+      unless params.empty?
+        # Server-side prepare so parameters travel as TYPED values; arrays
+        # and Hashes have no SQL literal form. $N is rewritten to the
+        # positional ? the server expects.
+        qsql, order = Skaidb.to_qmark(sql.to_s, params)
+        prep = prepare_server(qsql)
+        unless prep.nil?
+          id, nparams = prep
+          if nparams != order.length
+            raise QueryError, "statement expects #{nparams} parameters, got #{order.length}"
+          end
+
+          return exec_prepared(id, order, level)
+        end
+      end
+      run(Skaidb.bind(sql.to_s, params), level)
+    end
+
+    # Prepare +sql+ on the SERVER, returning [id, nparams], or nil when the
+    # server declines the statement kind (DDL, session statements) so the
+    # caller falls back to text binding. Cached per connection.
+    def prepare_server(sql)
+      hit = @prepared[sql]
+      return hit if hit
+      raise ConnectionError, "connection is closed" if @closed
+
+      sql_bytes = sql.dup.force_encoding("UTF-8").b
+      req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
+      reader = nil
+      @mutex.synchronize do
+        write_frame(req)
+        reader = Reader.new(read_frame)
+      end
+      tag = reader.u8
+      case tag
+      when 4
+        id = reader.u32
+        nparams = reader.u16
+        v = [id, nparams]
+        @prepared[sql] = v if @prepared.length < 240
+        v
+      when 3
+        reader.text
+        nil
+      else
+        raise QueryError, "unexpected prepare response tag #{tag}"
+      end
+    end
+
+    # Execute a prepared statement with TYPED parameters.
+    def exec_prepared(id, params, consistency)
+      raise ConnectionError, "connection is closed" if @closed
+
+      req = +([3, consistency].pack("CC") + [id].pack("V") + [params.length].pack("v"))
+      params.each do |p|
+        v = Skaidb.encode_value(p)
+        req << [v.bytesize].pack("V") << v
+      end
+      reader = nil
+      @mutex.synchronize do
+        write_frame(req)
+        reader = Reader.new(read_frame)
+      end
+      parse_response(reader)
     end
 
     # Close the connection. Idempotent.
