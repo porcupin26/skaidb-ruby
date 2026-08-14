@@ -493,7 +493,32 @@ module Skaidb
       @consistency = Consistency.resolve(consistency)
       @mutex = Mutex.new
       @closed = false
+      # Transport died; the next statement re-dials (see ensure_live!).
+      @broken = false
       @prepared = {}
+      # Retained so a reconnect repeats the original connect exactly.
+      @dial_args = { host: host, port: port, user: user, password: password,
+                     timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
+                     tls_insecure: tls_insecure, tls_server_name: tls_server_name,
+                     seeds: seeds }
+      dial!
+    end
+
+    # Connect, authenticate and enter the session database. Used for the first
+    # connect and for every reconnect, so a recovered connection is
+    # indistinguishable from a fresh one.
+    def dial!
+      host = @dial_args[:host]
+      port = @dial_args[:port]
+      user = @dial_args[:user]
+      password = @dial_args[:password]
+      timeout = @dial_args[:timeout]
+      database = @dial_args[:database]
+      tls = @dial_args[:tls]
+      tls_ca = @dial_args[:tls_ca]
+      tls_insecure = @dial_args[:tls_insecure]
+      tls_server_name = @dial_args[:tls_server_name]
+      seeds = @dial_args[:seeds]
       # Seeds: try each until one connects AND authenticates — a node that
       # accepts TCP while unhealthy must not swallow the attempt. skaidb is
       # leaderless, so any node serves; the order is shuffled so many
@@ -640,6 +665,7 @@ module Skaidb
     def stream(sql, consistency: nil)
       return enum_for(:stream, sql, consistency: consistency) unless block_given?
       raise ConnectionError, "connection is closed" if @closed
+      ensure_live!
 
       level = consistency.nil? ? @consistency : Consistency.resolve(consistency)
       sql_bytes = sql.dup.force_encoding("UTF-8").b
@@ -701,6 +727,7 @@ module Skaidb
       hit = @prepared[sql]
       return hit if hit
       raise ConnectionError, "connection is closed" if @closed
+      ensure_live!
 
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
@@ -767,7 +794,36 @@ module Skaidb
       payload = payload.b
       @sock.write([payload.bytesize].pack("N") + payload) # length is BE
     rescue StandardError => e
+      @broken = true
       raise ConnectionError, "write failed: #{e.message}"
+    end
+
+    # Re-dial if the transport died since the last statement, BEFORE anything
+    # is prepared on it.
+    #
+    # The prepared-statement cache MUST be cleared: an id is only valid on the
+    # connection that created it, so carrying one across a reconnect would run
+    # a different statement (or fail obscurely).
+    def ensure_live!
+      raise ConnectionError, "connection is closed" if @closed
+      return unless @broken
+
+      @prepared.clear
+      begin
+        @sock&.close
+      rescue StandardError
+        nil
+      end
+      @sock = nil
+      # Cleared BEFORE dialling: dial! issues USE, which runs a statement and
+      # would otherwise re-enter this method forever.
+      @broken = false
+      begin
+        dial!
+      rescue StandardError => e
+        @broken = true          # still down; the next statement retries
+        raise e
+      end
     end
 
     def read_frame
@@ -784,9 +840,13 @@ module Skaidb
         chunk = begin
           @sock.read(n - buf.bytesize)
         rescue StandardError => e
+          @broken = true
           raise ConnectionError, "read failed: #{e.message}"
         end
-        raise ConnectionError, "connection closed by server" if chunk.nil? || chunk.empty?
+        if chunk.nil? || chunk.empty?
+          @broken = true
+          raise ConnectionError, "connection closed by server"
+        end
 
         buf << chunk
       end
@@ -833,6 +893,7 @@ module Skaidb
 
     def run(sql, consistency)
       raise ConnectionError, "connection is closed" if @closed
+      ensure_live!
 
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [1, consistency].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
