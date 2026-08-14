@@ -1,7 +1,7 @@
 # skaidb — Ruby driver
 
 A small client for skaidb's binary wire protocol, with an API modelled on the
-[ruby-pg](https://github.com/ged/ruby-pg) gem (`PG`). If you've used Postgres
+[ruby-pg](https://rubygems.org/gems/pg) gem (`PG`). If you've used Postgres
 from Ruby, this should feel familiar. **Pure standard library** — no gems
 (only `socket`, `openssl`, `securerandom`, `bigdecimal`).
 
