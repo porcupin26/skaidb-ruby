@@ -770,6 +770,11 @@ module Skaidb
     end
 
     # Close the connection. Idempotent.
+    # False once closed, or once a transport error broke the socket.
+    def usable?
+      !@closed && !@broken
+    end
+
     def close
       return if @closed
 
@@ -957,6 +962,91 @@ module Skaidb
       yield conn
     ensure
       conn.close
+    end
+  end
+  # A thread-safe pool of connections.
+  #
+  # +maxsize+ bounds the connections kept IDLE, not the number checked out: a
+  # burst creates extras and the surplus is closed on return. Every keyword
+  # accepted by Skaidb.connect passes through, so pooled connections inherit
+  # seed failover, TLS and the session database.
+  #
+  #   pool = Skaidb::Pool.new(seeds: ["h1:7000", "h2:7000"], database: "app", maxsize: 8)
+  #   pool.with { |conn| conn.exec("SELECT 1") }
+  #   pool.close
+  class Pool
+    def initialize(maxsize: 10, **connect_kwargs)
+      raise ArgumentError, "maxsize must be >= 1" if maxsize < 1
+
+      @maxsize = maxsize
+      @kwargs = connect_kwargs
+      @idle = []
+      @mutex = Mutex.new
+      @closed = false
+    end
+
+    # Check out a usable connection, reusing an idle one when possible.
+    def checkout
+      loop do
+        conn = @mutex.synchronize do
+          raise Error, "pool is closed" if @closed
+
+          @idle.pop
+        end
+        return Skaidb.connect(**@kwargs) if conn.nil?
+        # A connection the server closed while it sat idle still looks fine
+        # locally, so check before handing it out.
+        return conn if conn.usable?
+
+        begin
+          conn.close
+        rescue StandardError
+          nil
+        end
+      end
+    end
+
+    # Return a connection, closing it if broken or the pool is full.
+    def checkin(conn)
+      keep = @mutex.synchronize do
+        !@closed && conn.usable? && @idle.length < @maxsize
+      end
+      if keep
+        @mutex.synchronize { @idle.push(conn) }
+        return
+      end
+      begin
+        conn.close
+      rescue StandardError
+        nil
+      end
+    end
+
+    # Run the block with a checked-out connection, returning it afterwards.
+    def with
+      conn = checkout
+      begin
+        yield conn
+      ensure
+        checkin(conn)
+      end
+    end
+
+    # Close the pool and every idle connection.
+    def close
+      drained = @mutex.synchronize do
+        @closed = true
+        d = @idle
+        @idle = []
+        d
+      end
+      drained.each do |c|
+        begin
+          c.close
+        rescue StandardError
+          nil
+        end
+      end
     end
   end
 end
