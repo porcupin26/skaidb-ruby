@@ -770,6 +770,38 @@ module Skaidb
     end
 
     # Close the connection. Idempotent.
+    # Yield a stream's events as they arrive, forever.
+    #
+    # A dependency-free helper over the stream's log: pages it with the
+    # keyset cursor and yields each event as a Hash (id, op, k, ts, doc).
+    # +id+ is the position — keep the last one and pass it as +after+ to
+    # resume exactly where you stopped, across restarts.
+    #
+    # This polls; for push delivery subscribe to $stream/<db>/<name> with any
+    # MQTT client instead. The events are identical.
+    #
+    #   conn.subscribe("big_orders") { |ev| handle(ev["doc"]) }
+    def subscribe(stream, after: nil, poll: 0.5)
+      log = "_stream_#{stream}"
+      cur = after
+      loop do
+        res = if cur.nil?
+                exec("SELECT id, op, k, ts, doc FROM #{log} ORDER BY id LIMIT 500")
+              else
+                exec_params(
+                  "SELECT id, op, k, ts, doc FROM #{log} WHERE id > $1 ORDER BY id LIMIT 500",
+                  [cur]
+                )
+              end
+        rows = res.to_a
+        rows.each do |row|
+          cur = row["id"]
+          yield row
+        end
+        sleep(poll) if rows.empty?
+      end
+    end
+
     # False once closed, or once a transport error broke the socket.
     def usable?
       !@closed && !@broken
