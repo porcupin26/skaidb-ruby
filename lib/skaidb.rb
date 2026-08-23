@@ -551,8 +551,24 @@ module Skaidb
         raise ConnectionError,
               "no reachable endpoint in #{endpoints.map { |(h, q)| "#{h}:#{q}" }.join(', ')}: #{last.message}"
       end
+      send_hello
       # USE is per-connection session state, so it runs on every dial.
       exec(%(USE "#{database.to_s.gsub('"', '""')}")) if database && !database.to_s.empty?
+    end
+
+    # Best-effort self-identification: fills the server's +drivers+ table
+    # client_name/client_version. An old server answers the unknown opcode
+    # with an error frame, which is ignored — identity is telemetry, never
+    # load-bearing.
+    def send_hello
+      name = "ruby"
+      ver = Skaidb::VERSION
+      req = [8].pack("C") + [name.bytesize].pack("V") + name +
+            [ver.bytesize].pack("V") + ver
+      write_frame(req)
+      read_frame
+    rescue StandardError
+      nil
     end
 
     # Upgrade a connected socket to TLS. A server with client_tls = required
