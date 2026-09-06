@@ -413,8 +413,13 @@ module Skaidb
     attr_reader :rows
     # @return [Integer] number of rows affected by a mutation (0 otherwise)
     attr_reader :cmd_tuples
+    # @return [Array<Result>] every result set of a multi-set reply (a CALL
+    #   whose body EMITted), in order; this Result is the LAST of them.
+    #   Empty for an ordinary single-set reply.
+    attr_reader :result_sets
 
-    def initialize(fields:, rows:, cmd_tuples: 0)
+    def initialize(fields:, rows:, cmd_tuples: 0, result_sets: [])
+      @result_sets = result_sets
       @fields = fields
       @rows = rows
       @cmd_tuples = cmd_tuples
@@ -970,6 +975,19 @@ module Skaidb
           Array.new(ncells) { Skaidb.decode_value(Reader.new(r.blob)) }
         end
         Result.new(fields: columns, rows: rows, cmd_tuples: 0)
+      when 8 # ResultSets: a CALL whose body EMITted
+        sets = Array.new(r.u32) do
+          ncols = r.u32
+          columns = Array.new(ncols) { r.text }
+          nrows = r.u32
+          rows = Array.new(nrows) do
+            ncells = r.u32
+            Array.new(ncells) { Skaidb.decode_value(Reader.new(r.blob)) }
+          end
+          Result.new(fields: columns, rows: rows, cmd_tuples: 0)
+        end
+        last = sets.last || Result.new(fields: [], rows: [], cmd_tuples: 0)
+        Result.new(fields: last.fields, rows: last.rows, cmd_tuples: 0, result_sets: sets)
       when 1 # Mutation
         Result.new(fields: [], rows: [], cmd_tuples: r.u64)
       when 2 # Ddl
