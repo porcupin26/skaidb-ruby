@@ -695,6 +695,11 @@ module Skaidb
     # connection is marked broken instead, so +usable?+ turns false and Pool
     # drops it rather than handing out a desynced socket.
     #
+    # Draining is not free and there is no cancel opcode: breaking out of a
+    # million-row scan still transfers the rest of it before the connection
+    # is usable again. If you only want the first few rows, say so in SQL
+    # (+LIMIT+) rather than by abandoning the stream.
+    #
     # With no block this returns an Enumerator. +each+, +map+, +take+ and the
     # rest of Enumerable are safe — they unwind through the ensure. External
     # iteration (+next+, +peek+) is NOT: it runs the stream inside the
@@ -725,9 +730,19 @@ module Skaidb
         when 1, 2
           return nil # not row-producing
         when 5
-          cols = Array.new(r.u32) { r.text }
+          # The server has already committed to a row stream, so from here
+          # the socket carries frames this call owns — mark it BEFORE
+          # parsing the header, not after. `Reader#take` raises on a
+          # truncated or absurd column count, and a raise between the
+          # commitment and the flag skips the drain entirely: nothing sets
+          # `@broken`, `usable?` stays true, and the pool files a socket
+          # parked mid-reply back for the next caller, who reads a leftover
+          # chunk and gets "unknown response tag 6". That is the very
+          # desync the ensure below exists to prevent, reachable through a
+          # two-line window.
           live = true
           @streaming = true
+          cols = Array.new(r.u32) { r.text }
           begin
             while live
               fr = Reader.new(read_frame)
@@ -920,10 +935,24 @@ module Skaidb
 
     # Read out the frames left over from a stream the caller walked away from,
     # so the connection is positioned at a request boundary again. Deliberately
-    # never raises: it runs from an ensure, where an exception would replace
-    # whatever the caller's block was already unwinding with. A drain that
-    # cannot finish marks the connection broken instead — usable? then fails
+    # Runs from an ensure, where an exception would replace whatever the
+    # caller's block was already unwinding with — so an ordinary failure
+    # marks the connection broken rather than raising. usable? then fails
     # and ensure_live! re-dials before the next statement.
+    #
+    # Not exception-PROOF, and the difference matters: the rescue below
+    # catches StandardError, so Interrupt, SignalException and
+    # NoMemoryError still escape. They also skip the `@streaming = false`
+    # in the caller's ensure, which leaves the connection permanently
+    # unusable — safe, but only because "unusable" is the failing
+    # direction. Rescuing Exception here would hide a Ctrl-C, which is a
+    # worse trade than retiring one connection.
+    #
+    # There is also no read DEADLINE. A peer that is alive but silent
+    # blocks the drain forever, holding @mutex — the same as every other
+    # read in this driver, and `close` deliberately does not take @mutex
+    # so another thread can break it. A genuinely dead socket (EOF, RST)
+    # exits correctly.
     def drain_stream!
       loop do
         tag = Reader.new(read_frame).u8
