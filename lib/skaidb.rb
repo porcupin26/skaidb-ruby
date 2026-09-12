@@ -22,9 +22,10 @@
 #   res.each { |row| puts row["name"] }    # => "Ada"
 #   conn.close
 #
-# Placeholders use the pg-style +$1+, +$2+, ... and are interpolated into the
-# SQL client-side with correct quoting (the protocol has no server-side bind
-# parameters).
+# Placeholders use the pg-style +$1+, +$2+, ... . They are sent as TYPED values
+# through a server-side prepared statement where the server accepts one, and
+# interpolated into the SQL client-side, with correct quoting, where it does not
+# (old servers, and statement kinds that cannot be prepared).
 require "socket"
 require "openssl"
 require "securerandom"
@@ -500,6 +501,8 @@ module Skaidb
       @closed = false
       # Transport died; the next statement re-dials (see ensure_live!).
       @broken = false
+      # A stream is in flight, so the socket sits mid-reply (see stream).
+      @streaming = false
       @prepared = {}
       # Retained so a reconnect repeats the original connect exactly.
       @dial_args = { host: host, port: port, user: user, password: password,
@@ -680,9 +683,28 @@ module Skaidb
     #
     #   conn.stream("SELECT ...") { |row| puts row["id"] }
     #
-    # The connection is busy until the stream ends; breaking out of the block
-    # drains the remaining frames so the connection stays usable. Takes no
-    # parameters — the streaming opcode carries SQL text.
+    # The protocol forbids any other request on the connection until the
+    # stream ends, so the whole exchange runs under the connection mutex
+    # instead of one lock per frame: a statement from another thread WAITS
+    # for the stream rather than interleaving frames with it.
+    #
+    # Leaving the block early — +break+, +return+ or an exception — unwinds
+    # through the ensure below, which drains whatever the server is still
+    # sending so the connection sits at a request boundary again. When it
+    # cannot (dead socket, a frame that makes no sense mid-stream) the
+    # connection is marked broken instead, so +usable?+ turns false and Pool
+    # drops it rather than handing out a desynced socket.
+    #
+    # With no block this returns an Enumerator. +each+, +map+, +take+ and the
+    # rest of Enumerable are safe — they unwind through the ensure. External
+    # iteration (+next+, +peek+) is NOT: it runs the stream inside the
+    # Enumerator's Fiber, and a Fiber abandoned part-way is collected without
+    # running any ensure, so nothing drains and the mutex is never released.
+    # Such a connection stays marked busy on purpose (+usable?+ is false for
+    # the whole stream), which is what keeps it out of the pool. Iterate with
+    # a block or +each+ if you mean to reuse the connection.
+    #
+    # Takes no parameters — the streaming opcode carries SQL text.
     def stream(sql, consistency: nil)
       return enum_for(:stream, sql, consistency: consistency) unless block_given?
       raise ConnectionError, "connection is closed" if @closed
@@ -705,6 +727,7 @@ module Skaidb
         when 5
           cols = Array.new(r.u32) { r.text }
           live = true
+          @streaming = true
           begin
             while live
               fr = Reader.new(read_frame)
@@ -721,18 +744,20 @@ module Skaidb
                 live = false
                 raise QueryError, fr.text
               else
+                # Mid-stream the server sends only RowsChunk, RowsEnd or Error.
+                # Anything else means we no longer know where the reply ends, so
+                # there is no draining back to a request boundary: retire it.
                 live = false
+                @broken = true
                 raise QueryError, "unexpected frame in stream"
               end
             end
           ensure
-            # Abandoned early: drain so leftovers are not read as the reply
-            # to the next statement.
-            while live
-              fr = Reader.new(read_frame)
-              t = fr.u8
-              live = false if t == 7 || t == 3
-            end
+            drain_stream! if live
+            # Cleared last: until this point the connection is mid-reply, and a
+            # caller who never unwinds here (an abandoned Enumerator Fiber)
+            # leaves it set, so usable? keeps reporting the truth.
+            @streaming = false
           end
         else
           raise QueryError, "unexpected response tag #{tag} to stream request"
@@ -823,9 +848,12 @@ module Skaidb
       end
     end
 
-    # False once closed, or once a transport error broke the socket.
+    # False once closed, once a transport error broke the socket, or while a
+    # stream is in flight — mid-stream the socket is parked in the middle of a
+    # reply, and a stream abandoned without unwinding never clears the flag, so
+    # this is what stops Pool checking a desynced connection back in.
     def usable?
-      !@closed && !@broken
+      !@closed && !@broken && !@streaming
     end
 
     def close
@@ -888,6 +916,27 @@ module Skaidb
       head = read_exact(4)
       length = head.unpack1("N") # BE
       read_exact(length)
+    end
+
+    # Read out the frames left over from a stream the caller walked away from,
+    # so the connection is positioned at a request boundary again. Deliberately
+    # never raises: it runs from an ensure, where an exception would replace
+    # whatever the caller's block was already unwinding with. A drain that
+    # cannot finish marks the connection broken instead — usable? then fails
+    # and ensure_live! re-dials before the next statement.
+    def drain_stream!
+      loop do
+        tag = Reader.new(read_frame).u8
+        break if tag == 7 || tag == 3 # RowsEnd, or an Error that ended the stream
+        next if tag == 6              # RowsChunk: more to come
+
+        @broken = true
+        break
+      end
+    rescue StandardError
+      # An I/O failure already set @broken in read_exact; set it for the rest
+      # (a truncated frame, say) so the socket is never reused mid-reply.
+      @broken = true
     end
 
     def read_exact(n)
