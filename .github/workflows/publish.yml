@@ -64,9 +64,9 @@ jobs:
         env:
           GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
         run: |
-          listed() {  # succeeds when rubygems.org lists skaidb $1
-            curl -fsS -o "$RUNNER_TEMP/versions.json" https://rubygems.org/api/v1/versions/skaidb.json 2>/dev/null || return 1
-            ruby -rjson -e 'exit JSON.parse(File.read(ARGV[0])).any? { |v| v["number"] == ARGV[1] }' "$RUNNER_TEMP/versions.json" "$1"
+          listed() {  # succeeds when rubygems.org has skaidb $1; the query string
+            # skips the CDN, which keeps serving a 404 for minutes after a push
+            curl -fsS -o /dev/null "https://rubygems.org/api/v2/rubygems/skaidb/versions/$1.json?ci=$(date +%s)-$RANDOM" 2>/dev/null
           }
           if [ -z "$GEM_HOST_API_KEY" ]; then
             echo "::notice title=RubyGems push skipped::RUBYGEMS_API_KEY secret is not set; nothing was pushed. Add it under Settings → Secrets and variables → Actions (a rubygems.org API key with the push scope), or push by hand: GEM_HOST_API_KEY=… gem push skaidb-$VERSION.gem (https://rubygems.org/gems/skaidb)"
@@ -81,7 +81,11 @@ jobs:
           # stdin closed and a hard timeout: an OTP prompt cannot hang the job
           set -o pipefail
           if ! timeout 300 gem push "skaidb-$VERSION.gem" < /dev/null 2>&1 | tee "$RUNNER_TEMP/push.log"; then
-            if grep -qi 'MFA' "$RUNNER_TEMP/push.log"; then
+            if grep -qi 'repushing' "$RUNNER_TEMP/push.log"; then
+              echo "::notice title=RubyGems push skipped::skaidb $VERSION is already on rubygems.org; nothing was pushed"
+              echo "RubyGems.org: already lists skaidb $VERSION, nothing pushed" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            elif grep -qi 'MFA' "$RUNNER_TEMP/push.log"; then
               echo "::error title=RubyGems refused the push::the rubygems.org account behind RUBYGEMS_API_KEY needs MFA at the 'UI and gem signin' level (https://rubygems.org/settings/edit) for this gem; enable it, then re-run this workflow"
             else
               echo "::error title=RubyGems refused the push::RUBYGEMS_API_KEY must be a rubygems.org API key with the push scope, owned by an owner of the skaidb gem (https://rubygems.org/profile/api_keys)"
@@ -96,7 +100,7 @@ jobs:
             fi
             sleep 5
           done
-          echo "::warning::gem push succeeded but https://rubygems.org/api/v1/versions/skaidb.json does not list $VERSION yet (the index can lag a few minutes)"
+          echo "::warning::gem push succeeded but rubygems.org does not list skaidb $VERSION yet (the index can lag a few minutes): https://rubygems.org/gems/skaidb/versions/$VERSION"
           echo "RubyGems.org: pushed skaidb $VERSION (the index had not caught up when the run checked)" >> "$GITHUB_STEP_SUMMARY"
       - name: GitHub Release with the gem attached
         id: gh_release
