@@ -34,7 +34,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.0.2"
+  VERSION = "1.0.3"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end

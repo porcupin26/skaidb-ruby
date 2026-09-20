@@ -4,9 +4,22 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [1.0.2] - 2026-09-20
+## [1.0.3] - 2026-09-20
 
 Release automation: published from GitHub Actions. No code change.
+
+### Changed
+- The gemspec no longer sets `rubygems_mfa_required`: rubygems.org refused
+  the 1.0.2 push with "Rubygem requires owners to enable MFA" because the
+  account behind the CI key has no MFA yet. Put it back once MFA ("UI and
+  gem signin") is enabled on that account.
+- `publish.yml` turns a refused push into an actionable error (MFA to
+  enable, or a key without the push scope) instead of a bare exit code.
+
+## [1.0.2] - 2026-09-20
+
+Tagged but never published: rubygems.org refused the push (see 1.0.3), so
+there is no gem and no GitHub Release for this tag. Superseded by 1.0.3.
 
 ### Changed
 - A `v*` tag pushed to GitHub publishes that version by itself
@@ -103,6 +116,7 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.0.3]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-ruby/releases/tag/v1.0.0

@@ -19,7 +19,12 @@ Gem::Specification.new do |spec|
     "changelog_uri" => "https://github.com/porcupin26/skaidb-ruby/blob/main/CHANGELOG.md",
     "documentation_uri" => "https://github.com/porcupin26/skaidb-ruby/tree/main/docs",
     "bug_tracker_uri" => "https://github.com/porcupin26/skaidb-ruby/issues",
-    "rubygems_mfa_required" => "true",
+    # "rubygems_mfa_required" => "true" is deliberately not set: rubygems.org
+    # refuses every push of a gem that carries it unless the pushing account
+    # has MFA enabled, and the account behind the CI key (RUBYGEMS_API_KEY)
+    # has none yet. Enable MFA at the "UI and gem signin" level on that
+    # account (https://rubygems.org/settings/edit), then put the line back;
+    # API-key pushes keep working at that level.
   }
 
   spec.required_ruby_version = ">= 2.7"

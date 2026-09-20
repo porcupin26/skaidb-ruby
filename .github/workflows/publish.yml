@@ -79,7 +79,15 @@ jobs:
             exit 0
           fi
           # stdin closed and a hard timeout: an OTP prompt cannot hang the job
-          timeout 300 gem push "skaidb-$VERSION.gem" < /dev/null
+          set -o pipefail
+          if ! timeout 300 gem push "skaidb-$VERSION.gem" < /dev/null 2>&1 | tee "$RUNNER_TEMP/push.log"; then
+            if grep -qi 'MFA' "$RUNNER_TEMP/push.log"; then
+              echo "::error title=RubyGems refused the push::the rubygems.org account behind RUBYGEMS_API_KEY needs MFA at the 'UI and gem signin' level (https://rubygems.org/settings/edit) for this gem; enable it, then re-run this workflow"
+            else
+              echo "::error title=RubyGems refused the push::RUBYGEMS_API_KEY must be a rubygems.org API key with the push scope, owned by an owner of the skaidb gem (https://rubygems.org/profile/api_keys)"
+            fi
+            exit 1
+          fi
           for _ in $(seq 1 24); do
             if listed "$VERSION"; then
               echo "rubygems.org lists skaidb $VERSION"

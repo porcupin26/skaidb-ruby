@@ -54,13 +54,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.2/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.3/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.0.2.gem`.
+installs without registry access: `gem install ./skaidb-1.0.3.gem`.
 
 ## Quick start
 
@@ -404,7 +404,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.0.2
+-- ruby | 1.0.3
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after
