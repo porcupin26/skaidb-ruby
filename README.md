@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/porcupin26/skaidb-ruby/actions/workflows/ci.yml/badge.svg)](https://github.com/porcupin26/skaidb-ruby/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/porcupin26/skaidb-ruby?label=release)](https://github.com/porcupin26/skaidb-ruby/releases/latest)
+[![Gem](https://img.shields.io/gem/v/skaidb?label=rubygems)](https://rubygems.org/gems/skaidb)
 [![License: SSPL-1.0](https://img.shields.io/badge/license-SSPL--1.0-blue.svg)](https://github.com/porcupin26/skaidb-ruby/blob/main/LICENSE)
 
 The official Ruby driver for [skaidb](https://skaidb.org). The API is modelled
@@ -15,6 +16,7 @@ parameters, one-round-trip batches, streamed result sets, multi-seed failover,
 transparent reconnect, TLS and connection pooling.
 
 - Repository: <https://github.com/porcupin26/skaidb-ruby>
+- RubyGems: <https://rubygems.org/gems/skaidb>
 - Full reference: [`docs/`](https://github.com/porcupin26/skaidb-ruby/tree/main/docs) —
   [getting started](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/getting-started.md),
   [API reference](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/api.md),
@@ -28,21 +30,19 @@ transparent reconnect, TLS and connection pooling.
 
 ## Install
 
-The gem is not on RubyGems.org yet; installs come from the GitHub release or
-the git tag. The package is named `skaidb` and required as `require "skaidb"`
-whichever way it is installed.
-
-From the release asset:
+The gem is published on RubyGems.org as
+[`skaidb`](https://rubygems.org/gems/skaidb) and is loaded with
+`require "skaidb"`:
 
 ```sh
-curl -LO https://github.com/porcupin26/skaidb-ruby/releases/download/v1.0.0/skaidb-1.0.0.gem
-gem install ./skaidb-1.0.0.gem
+gem install skaidb
 ```
 
-With Bundler, from the tag:
+With Bundler:
 
 ```ruby
-gem 'skaidb', git: 'https://github.com/porcupin26/skaidb-ruby', tag: 'v1.0.0'
+# Gemfile
+gem "skaidb", "~> 1.0"
 ```
 
 Bundler resolves the gem's one dependency, `bigdecimal` (part of Ruby's
@@ -50,16 +50,17 @@ standard library, declared because it is a bundled rather than default gem
 from Ruby 3.4), from RubyGems.org and compiles it, even on a Ruby that ships
 it; that needs the Ruby headers and a C toolchain (`ruby-dev` and
 `build-essential` on Debian/Ubuntu, `ruby-devel` and `gcc` on Fedora/RHEL,
-Xcode command-line tools on macOS). On a Ruby that already ships
-`bigdecimal`, `bundle install --local` skips the RubyGems.org lookup, uses
-the installed copy and compiles nothing (the git source is still fetched).
-`gem install` of the release asset and vendoring likewise reuse the
-`bigdecimal` already installed.
+Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
+the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.0/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.1/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
+
+Every release is also attached as a `.gem` to its
+[GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
+installs without registry access: `gem install ./skaidb-1.0.1.gem`.
 
 ## Quick start
 
@@ -403,7 +404,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.0.0
+-- ruby | 1.0.1
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after

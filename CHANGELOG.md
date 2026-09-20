@@ -4,6 +4,17 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-09-20
+
+Published to RubyGems.org as [`skaidb`](https://rubygems.org/gems/skaidb).
+Install instructions only; no code change.
+
+### Changed
+- Install: `gem install skaidb`, or `gem "skaidb", "~> 1.0"` in a Gemfile.
+  The README, `docs/getting-started.md` and the release notes no longer
+  point at the GitHub release asset or the git tag as the install channel;
+  the built `.gem` stays attached to every GitHub release.
+
 ## [1.0.0] - 2026-09-20
 
 First release as a standalone repository
@@ -79,4 +90,5 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.0.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-ruby/releases/tag/v1.0.0

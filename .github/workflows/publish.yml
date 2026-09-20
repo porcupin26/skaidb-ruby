@@ -3,8 +3,9 @@ name: Publish
 # Runs on every v* tag: checks the tag against the package version, builds
 # the gem, attaches it to a GitHub Release for the tag, and pushes it to
 # RubyGems.org only when the RUBYGEMS_API_KEY repository secret exists.
-# Without the secret the push is skipped with a notice and the release asset
-# is the install channel (see README "Install").
+# Without the secret the push is skipped with a notice and the gem is pushed
+# by hand (GEM_HOST_API_KEY=… gem push skaidb-<version>.gem); the release
+# asset mirrors what is on https://rubygems.org/gems/skaidb.
 
 on:
   push:
@@ -44,7 +45,7 @@ jobs:
             on { print }
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then echo "Release $VERSION" > release-notes.md; fi
-          printf '\n---\nInstall: download `skaidb-%s.gem` below and run `gem install ./skaidb-%s.gem`, or `gem '"'"'skaidb'"'"', git: '"'"'https://github.com/porcupin26/skaidb-ruby'"'"', tag: '"'"'v%s'"'"'` in a Gemfile.\n' "$VERSION" "$VERSION" "$VERSION" >> release-notes.md
+          printf '\n---\nInstall: `gem install skaidb` (https://rubygems.org/gems/skaidb), or `gem "skaidb", "~> 1.0"` in a Gemfile. The built `skaidb-%s.gem` is attached below for installs without registry access (`gem install ./skaidb-%s.gem`).\n' "$VERSION" "$VERSION" >> release-notes.md
       - name: GitHub Release with the gem attached
         uses: softprops/action-gh-release@v2
         with:
@@ -57,7 +58,7 @@ jobs:
           GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
         run: |
           if [ -z "$GEM_HOST_API_KEY" ]; then
-            echo "::notice title=RubyGems push skipped::RUBYGEMS_API_KEY secret is not set; nothing was pushed. Install from the release asset: https://github.com/porcupin26/skaidb-ruby/releases/download/v$VERSION/skaidb-$VERSION.gem"
+            echo "::notice title=RubyGems push skipped::RUBYGEMS_API_KEY secret is not set; nothing was pushed. Push by hand: GEM_HOST_API_KEY=… gem push skaidb-$VERSION.gem (https://rubygems.org/gems/skaidb)"
             exit 0
           fi
           gem push "skaidb-$VERSION.gem"

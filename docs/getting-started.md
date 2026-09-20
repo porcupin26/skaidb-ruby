@@ -2,22 +2,19 @@
 
 ## Install
 
-The gem is not on RubyGems.org yet, so installs come from the GitHub release
-or the git tag. Whichever way it is installed the library is loaded with
-`require "skaidb"`.
-
-From the release asset:
+The gem is published on RubyGems.org as
+[`skaidb`](https://rubygems.org/gems/skaidb); whichever way it is installed
+the library is loaded with `require "skaidb"`.
 
 ```sh
-curl -LO https://github.com/porcupin26/skaidb-ruby/releases/download/v1.0.0/skaidb-1.0.0.gem
-gem install ./skaidb-1.0.0.gem
+gem install skaidb
 ```
 
-With Bundler, from the tag:
+With Bundler:
 
 ```ruby
 # Gemfile
-gem 'skaidb', git: 'https://github.com/porcupin26/skaidb-ruby', tag: 'v1.0.0'
+gem "skaidb", "~> 1.0"
 ```
 
 Or vendor the single file `lib/skaidb.rb` into your project and
