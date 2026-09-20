@@ -54,6 +54,17 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   driver's placeholders are `$1, $2, …`.
 - The frame read buffer is created as a binary String, so appending socket
   bytes can never trigger an encoding conversion.
+- On the prepared path (`exec_params`, `exec_batch`) a parameter that no
+  `$N` placeholder referenced was dropped silently: `exec_params("… WHERE
+  id = $1", [1, "extra"])` ran, and a batch row one value too long was
+  truncated to the placeholders and applied. Both now raise `QueryError`
+  (`more parameters (N) than placeholders ($M)`) before anything is sent,
+  as the text path always did.
+- Documentation: a Document result's `Hash` keys arrive in the order the
+  server sends them (it stores documents with keys sorted at every level),
+  not in binding order as the type tables claimed; the Install section says
+  that Bundler compiles `bigdecimal` from RubyGems.org, which needs the Ruby
+  headers and a C toolchain.
 
 ### Changed
 - The version is defined once, as `Skaidb::VERSION` in `lib/skaidb.rb`; the

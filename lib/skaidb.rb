@@ -287,10 +287,14 @@ module Skaidb
   # prepared statements use, returning [sql, params_in_wire_order]. A
   # parameter referenced twice is sent twice — +?+ is positional and cannot
   # say "the same one again". +$N+ inside a string literal is left alone.
+  # Like +bind+, a parameter no placeholder references is an error: the
+  # server only ever sees the referenced values, so without this check an
+  # extra value (a batch row one column too long, say) would vanish silently.
   def self.to_qmark(sql, params)
     params ||= []
     out = +""
     order = []
+    max_used = 0
     in_str = false
     i = 0
     n = sql.length
@@ -323,6 +327,7 @@ module Skaidb
         raise QueryError, "placeholder $#{idx} has no parameter" if idx > params.length
 
         order << params[idx - 1]
+        max_used = idx if idx > max_used
         out << "?"
         i = j
         next
@@ -336,6 +341,10 @@ module Skaidb
       out << ch
       i += 1
     end
+    if params.length > max_used
+      raise QueryError, "more parameters (#{params.length}) than placeholders ($#{max_used})"
+    end
+
     [out, order]
   end
 

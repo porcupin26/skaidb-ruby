@@ -45,6 +45,14 @@ With Bundler, from the tag:
 gem 'skaidb', git: 'https://github.com/porcupin26/skaidb-ruby', tag: 'v1.0.0'
 ```
 
+Bundler resolves the gem's one dependency, `bigdecimal` (part of Ruby's
+standard library, declared because it is a bundled rather than default gem
+from Ruby 3.4), from RubyGems.org and compiles it, even on a Ruby that ships
+it; that needs the Ruby headers and a C toolchain (`ruby-dev` and
+`build-essential` on Debian/Ubuntu, `ruby-devel` and `gcc` on Fedora/RHEL,
+Xcode command-line tools on macOS). `gem install` of the release asset and
+vendoring reuse the `bigdecimal` already installed and compile nothing.
+
 Or vendor the single file: copy
 [`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.0/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
@@ -327,7 +335,7 @@ instead; the events are identical.
 | Uuid         | `Skaidb::Uuid`                                | `String`, canonical lowercase       |
 | Timestamp    | `Time` (millisecond precision)                | `Time` (UTC)                        |
 | Array        | `Array`                                       | `Array`                             |
-| Document     | `Hash` (keys become Strings)                  | `Hash`, insertion order kept        |
+| Document     | `Hash` (keys become Strings)                  | `Hash`, keys in server order        |
 
 Worth knowing:
 
@@ -340,6 +348,10 @@ Worth knowing:
   same canonical form.
 - `Time` keeps its instant whatever its zone; sub-millisecond precision is
   truncated. Results are UTC.
+- A Document result is a `Hash` whose keys come back in the order the server
+  sends them, which is not the order they were bound in: the server stores a
+  document in canonical form, with keys sorted at every level. Do not rely
+  on key order.
 - An `Integer` outside the signed 64-bit range, a `NaN`/`Infinity` Float, a
   non-finite `BigDecimal` or one whose digits exceed a signed 128-bit
   mantissa, and any other type (`Date`, `Rational`, …) raise `QueryError` —

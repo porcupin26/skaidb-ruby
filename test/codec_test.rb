@@ -164,6 +164,12 @@ class CodecTest < Minitest::Test
     assert_equal [], order
     assert_raises(Skaidb::QueryError) { Skaidb.to_qmark("SELECT $3", [1, 2]) }
     assert_raises(Skaidb::QueryError) { Skaidb.to_qmark("SELECT $0", [1]) }
+    # an unreferenced parameter is an error, as on the text path (bind)
+    e = assert_raises(Skaidb::QueryError) { Skaidb.to_qmark("SELECT $1", [1, 2]) }
+    assert_equal "more parameters (2) than placeholders ($1)", e.message
+    e = assert_raises(Skaidb::QueryError) { Skaidb.to_qmark("SELECT 1", [1]) }
+    assert_equal "more parameters (1) than placeholders ($0)", e.message
+    assert_equal ["SELECT ?, ?", [2, 1]], Skaidb.to_qmark("SELECT $2, $1", [1, 2]) # every one referenced
   end
 
   def test_a_bare_question_mark_is_not_a_placeholder

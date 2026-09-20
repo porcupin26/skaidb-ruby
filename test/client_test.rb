@@ -115,6 +115,12 @@ class ClientTest < Minitest::Test
       assert_equal 1, executed[0].consistency # QUORUM default
       e = assert_raises(Skaidb::QueryError) { c.exec_params(sql, [1, 2]) }
       assert_match(/placeholder \$3 has no parameter/, e.message)
+      # an extra parameter is refused too, before anything is sent
+      sent = srv.requests.length
+      e = assert_raises(Skaidb::QueryError) { c.exec_params(sql, [1, [], {}, "EXTRA"]) }
+      assert_equal "more parameters (4) than placeholders ($3)", e.message
+      assert_equal sent, srv.requests.length
+      assert_equal 2, executed.length
       c.close
     end
   end
@@ -151,6 +157,12 @@ class ClientTest < Minitest::Test
       e = assert_raises(Skaidb::QueryError) { c.exec_batch("INSERT INTO t (id, v) VALUES ($1, $2)", [[1, "a"], [2, "b"]]) }
       assert_match(/row 1 failed/, e.message)
       assert_raises(Skaidb::QueryError) { c.exec_batch("INSERT INTO t (id, v) VALUES ($1, $2)", [[1]]) }
+      # a row with an extra value is refused (never silently truncated), and
+      # no frame goes out, so the well-formed rows before it are not applied
+      batches = srv.requests.count { |q| q.op == 7 }
+      e = assert_raises(Skaidb::QueryError) { c.exec_batch("INSERT INTO t (id, v) VALUES ($1, $2)", [[10, "a"], [11, "b", "EXTRA"]]) }
+      assert_equal "more parameters (3) than placeholders ($2)", e.message
+      assert_equal batches, srv.requests.count { |q| q.op == 7 }
       assert_raises(Skaidb::QueryError) { c.exec_batch("CREATE TABLE $1", [[1]]) } # unpreparable
       c.close
     end

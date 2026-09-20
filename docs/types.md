@@ -16,7 +16,7 @@ values to `exec_params` or `exec_batch`.
 | Uuid | `String`, canonical lowercase `8-4-4-4-12` | `Skaidb::Uuid` |
 | Timestamp | `Time` in UTC, millisecond precision (may predate 1970) | `Time` (any zone) |
 | Array | `Array` of mapped values | `Array` (elements follow this table) |
-| Document | `Hash` with String keys, insertion order kept | `Hash` (keys are converted with `to_s`) |
+| Document | `Hash` with String keys, in the order the server sends them | `Hash` (keys are converted with `to_s`) |
 
 ## Notes
 
@@ -35,6 +35,11 @@ values to `exec_params` or `exec_batch`.
   is sent as mantissa `12345`, scale `2`; trailing zeros are dropped and a
   positive exponent (`BigDecimal("1e5")`) is folded into the mantissa. A
   mantissa beyond ±2^127 raises `QueryError`.
+- **Document** results keep the key order the server sends; the driver adds
+  keys to the `Hash` as they arrive. That order is not the one the document
+  was bound in: the server stores a document in canonical form, with keys
+  sorted at every nesting level, so `{"zeta" => 1, "alpha" => 2}` comes back
+  as `{"alpha" => 2, "zeta" => 1}`. Do not rely on key order.
 - **Timestamp**: a `Time` keeps its instant whatever its zone (local,
   `+05:30`, UTC) and is truncated to the millisecond towards negative
   infinity, so `decode(encode(t)) == t` for any millisecond-precision `Time`.
