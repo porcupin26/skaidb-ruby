@@ -37,6 +37,10 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
 - `LICENSE` (SSPL-1.0), `CHANGELOG.md`, `Rakefile`, `.gitignore`.
 
 ### Fixed
+- README: the Examples section claimed every script takes `host port user
+  password [database]`; `tls.rb` takes `[ca.crt]` instead of a database and
+  `subscribe.rb` takes a further `[stream]`. Each script's arguments are now
+  listed.
 - `Time` parameters were converted to milliseconds through `Float`
   (`to_f * 1000`), which can be off by one millisecond for some instants;
   the conversion is now exact (`Rational`) and truncates towards negative

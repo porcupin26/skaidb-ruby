@@ -50,8 +50,11 @@ standard library, declared because it is a bundled rather than default gem
 from Ruby 3.4), from RubyGems.org and compiles it, even on a Ruby that ships
 it; that needs the Ruby headers and a C toolchain (`ruby-dev` and
 `build-essential` on Debian/Ubuntu, `ruby-devel` and `gcc` on Fedora/RHEL,
-Xcode command-line tools on macOS). `gem install` of the release asset and
-vendoring reuse the `bigdecimal` already installed and compile nothing.
+Xcode command-line tools on macOS). On a Ruby that already ships
+`bigdecimal`, `bundle install --local` skips the RubyGems.org lookup, uses
+the installed copy and compiles nothing (the git source is still fetched).
+`gem install` of the release asset and vendoring likewise reuse the
+`bigdecimal` already installed.
 
 Or vendor the single file: copy
 [`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.0/lib/skaidb.rb)
@@ -425,11 +428,20 @@ know the opcode answers with an error the driver ignores.
 [`examples/`](https://github.com/porcupin26/skaidb-ruby/tree/main/examples)
 contains runnable scripts: `basic.rb`, `prepared_batch.rb`, `stream.rb`,
 `pool.rb`, `tls.rb`, `subscribe.rb`. Each takes
-`host port user password [database]` on the command line and defaults to
-`localhost:7000`.
+`host port user password` on the command line and defaults to
+`localhost:7000`; the arguments after those differ per script:
+
+- `basic.rb`, `prepared_batch.rb`, `stream.rb`, `pool.rb`: `[database]`
+- `subscribe.rb`: `[database] [stream]` (the stream defaults to
+  `orders_stream`)
+- `tls.rb`: `[ca.crt]`, a CA file to trust; without it the script uses the
+  system trust store, or verifies nothing when `SKAIDB_TLS_INSECURE` is set
+  (development only). It takes no database argument.
 
 ```sh
 ruby examples/basic.rb localhost 7000 skaidb secret app
+ruby examples/subscribe.rb localhost 7000 skaidb secret app orders_stream
+ruby examples/tls.rb localhost 7000 skaidb secret /etc/skaidb/ca.crt
 ```
 
 ## Development

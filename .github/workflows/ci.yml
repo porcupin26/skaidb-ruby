@@ -19,8 +19,11 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: ${{ matrix.ruby }}
-      - name: Syntax
-        run: ruby -wc lib/skaidb.rb examples/*.rb test/*.rb test/live/*.rb
+      - name: Syntax (one ruby -wc per file; -c only checks the first path it is given)
+        run: |
+          for f in lib/skaidb.rb examples/*.rb test/*.rb test/live/*.rb; do
+            ruby -wc "$f" || exit 1
+          done
       - name: Unit tests (minitest from the stdlib, in-process fake server, no skaidb needed)
         run: ruby -w -Ilib -Itest -e 'Dir["test/*_test.rb"].sort.each { |f| require File.expand_path(f) }'
       - name: Live test is skipped without a server (never fails CI)
