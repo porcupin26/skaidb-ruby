@@ -32,7 +32,9 @@ require "securerandom"
 require "bigdecimal"
 
 module Skaidb
-  VERSION = "0.1.0"
+  # The package version — the single source of truth. The gemspec reads it,
+  # and it is what the driver reports to the server in the Hello frame.
+  VERSION = "1.0.0"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -84,6 +86,61 @@ module Skaidb
     TIMESTAMP = 8
     ARRAY = 9
     DOCUMENT = 10
+  end
+
+  # A UUID parameter. Results decode Uuid cells to their canonical lowercase
+  # String, and a String binds as a String, so wrap a value in +Uuid+ to bind
+  # it with the Uuid type tag: +Skaidb::Uuid.new("6ba7b810-9dad-11d1-80b4-00c04fd430c8")+.
+  # Compares equal to another Uuid, or to a String, with the same canonical form.
+  class Uuid
+    HEX32 = /\A\h{32}\z/.freeze
+
+    # @return [String] canonical lowercase 8-4-4-4-12 form
+    attr_reader :to_s
+
+    # @param str [String] 32 hex digits, with or without the usual dashes
+    def initialize(str)
+      hex = str.to_s.delete("-").downcase
+      raise ArgumentError, "not a UUID: #{str.inspect}" unless HEX32.match?(hex)
+
+      @to_s = Skaidb.format_uuid([hex].pack("H*")).freeze
+    end
+
+    # Build from the 16 raw bytes.
+    def self.from_bytes(bytes)
+      raise ArgumentError, "a UUID is 16 bytes" unless bytes.bytesize == 16
+
+      new(bytes.unpack1("H*"))
+    end
+
+    # A random (version 4) UUID.
+    def self.random
+      new(SecureRandom.uuid)
+    end
+
+    # @return [String] the 16 raw bytes (RFC 4122 order)
+    def bytes
+      [@to_s.delete("-")].pack("H*")
+    end
+
+    def ==(other)
+      case other
+      when Uuid then @to_s == other.to_s
+      when String
+        hex = other.delete("-").downcase
+        HEX32.match?(hex) && @to_s == Skaidb.format_uuid([hex].pack("H*"))
+      else false
+      end
+    end
+    alias eql? ==
+
+    def hash
+      @to_s.hash
+    end
+
+    def inspect
+      "#<Skaidb::Uuid #{@to_s}>"
+    end
   end
 
   # ---- byte reader ---------------------------------------------------------
@@ -215,9 +272,10 @@ module Skaidb
       end
     when Symbol
       "'" + arg.to_s.gsub("'", "''") + "'"
+    when Uuid
+      "'" + arg.to_s + "'"
     when Time
-      ms = (arg.to_r * 1000).round
-      ms.to_s
+      time_ms(arg).to_s
     else
       raise QueryError, "cannot bind value of type #{arg.class}"
     end
@@ -269,10 +327,52 @@ module Skaidb
         i = j
         next
       end
+      if ch == "?" && !params.empty?
+        # A `?` here would reach the server as ITS placeholder and fail late
+        # with a confusing arity error; say what the driver's syntax is.
+        raise QueryError, "this driver uses $1, $2, ... placeholders; '?' is not a placeholder"
+      end
+
       out << ch
       i += 1
     end
     [out, order]
+  end
+
+  I64_MIN = -(2**63)
+  I64_MAX = 2**63 - 1
+  I128_MIN = -(2**127)
+  I128_MAX = 2**127 - 1
+  U128_MASK = 2**128 - 1
+  U64_MASK = 2**64 - 1
+
+  # A BigDecimal as [mantissa, scale] with value = mantissa / 10^scale,
+  # matching the wire codec. The scale is unsigned, so a positive exponent is
+  # folded into the mantissa.
+  def self.decimal_parts(d)
+    raise QueryError, "cannot bind non-finite BigDecimal" if d.nan? || d.infinite?
+
+    sign, digits, _base, exponent = d.split # value = sign * 0.<digits> * 10^exponent
+    digits = digits.sub(/0+\z/, "")
+    digits = "0" if digits.empty?
+    mantissa = digits.to_i
+    mantissa = -mantissa if sign.negative?
+    scale = digits.length - exponent
+    if scale.negative?
+      mantissa *= 10**-scale
+      scale = 0
+    end
+    if mantissa < I128_MIN || mantissa > I128_MAX
+      raise QueryError, "BigDecimal mantissa does not fit a signed 128-bit integer"
+    end
+
+    [mantissa, scale]
+  end
+
+  # A Ruby Time as Unix milliseconds — exact (via Rational), truncated
+  # towards negative infinity so that decoding gives the same millisecond.
+  def self.time_ms(t)
+    (t.to_r * 1000).floor
   end
 
   # Encode a Ruby value as a TYPED skaidb value (tag + payload), the inverse
@@ -283,16 +383,32 @@ module Skaidb
     when nil then [0].pack("C")
     when true then [1, 1].pack("CC")
     when false then [1, 0].pack("CC")
-    when Integer then [2].pack("C") + [v].pack("q<")
+    when Integer
+      raise QueryError, "integer #{v} does not fit a signed 64-bit Int" if v < I64_MIN || v > I64_MAX
+
+      [2].pack("C") + [v].pack("q<")
     when Float
       raise QueryError, "cannot bind NaN/Infinity" if v.nan? || v.infinite?
 
       [3].pack("C") + [v].pack("E")
+    when BigDecimal
+      mantissa, scale = decimal_parts(v)
+      m = mantissa & U128_MASK
+      [4].pack("C") + [m & U64_MASK, m >> 64].pack("Q<Q<") + [scale].pack("V")
     when String
-      b = v.dup.force_encoding(Encoding::BINARY)
-      [5].pack("C") + [b.bytesize].pack("V") + b
+      if v.encoding == Encoding::BINARY
+        # ASCII-8BIT is how Ruby says "raw bytes": bind as Bytes.
+        [6].pack("C") + [v.bytesize].pack("V") + v
+      else
+        b = v.dup.force_encoding(Encoding::BINARY)
+        [5].pack("C") + [b.bytesize].pack("V") + b
+      end
+    when Symbol
+      encode_value(v.to_s)
+    when Uuid
+      [7].pack("C") + v.bytes
     when Time
-      [8].pack("C") + [(v.to_f * 1000).round].pack("q<")
+      [8].pack("C") + [time_ms(v)].pack("q<")
     when Array
       out = +([9].pack("C") + [v.length].pack("V"))
       v.each { |item| out << encode_value(item) }
@@ -504,6 +620,7 @@ module Skaidb
       # A stream is in flight, so the socket sits mid-reply (see stream).
       @streaming = false
       @prepared = {}
+      @last_prepare_error = nil
       # Retained so a reconnect repeats the original connect exactly.
       @dial_args = { host: host, port: port, user: user, password: password,
                      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
@@ -570,7 +687,7 @@ module Skaidb
     # load-bearing.
     def send_hello
       name = "ruby"
-      ver = Skaidb::VERSION
+      ver = Skaidb::VERSION # the package version, never a literal
       req = [8].pack("C") + [name.bytesize].pack("V") + name +
             [ver.bytesize].pack("V") + ver
       write_frame(req)
@@ -640,7 +757,17 @@ module Skaidb
           return exec_prepared(id, order, level)
         end
       end
-      run(Skaidb.bind(sql.to_s, params), level)
+      text = begin
+        Skaidb.bind(sql.to_s, params)
+      rescue QueryError => e
+        # The text path cannot carry this value (an Array, a Hash, ...), so
+        # the interesting error is the server's reason for refusing to
+        # prepare — usually a SQL mistake — not the fallback's limitation.
+        raise QueryError, "#{e.message}; the server would not prepare the statement: #{@last_prepare_error}" if @last_prepare_error
+
+        raise
+      end
+      run(text, level)
     end
 
     # Execute +sql+ once per row in ONE round-trip. Rows autocommit
@@ -806,7 +933,9 @@ module Skaidb
         @prepared[sql] = v if @prepared.length < 240
         v
       when 3
-        reader.text
+        # Refused: DDL/session statements cannot be prepared, and an old
+        # server answers "unknown opcode". Kept for the caller's error message.
+        @last_prepare_error = reader.text
         nil
       else
         raise QueryError, "unexpected prepare response tag #{tag}"
@@ -971,7 +1100,7 @@ module Skaidb
     def read_exact(n)
       return "".b if n.zero?
 
-      buf = +""
+      buf = String.new(capacity: n) # ASCII-8BIT, so appending raw bytes never re-encodes
       while buf.bytesize < n
         chunk = begin
           @sock.read(n - buf.bytesize)
