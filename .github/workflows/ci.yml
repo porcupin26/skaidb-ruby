@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  test:
+    name: ruby ${{ matrix.ruby }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.1', '3.2', '3.3', '3.4']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+      - name: Syntax
+        run: ruby -wc lib/skaidb.rb examples/*.rb test/*.rb test/live/*.rb
+      - name: Unit tests (minitest from the stdlib, in-process fake server, no skaidb needed)
+        run: ruby -w -Ilib -Itest -e 'Dir["test/*_test.rb"].sort.each { |f| require File.expand_path(f) }'
+      - name: Live test is skipped without a server (never fails CI)
+        run: ruby -Ilib test/live/live_test.rb
+      - name: Package builds
+        run: gem build skaidb.gemspec
+
+  package:
+    name: gem contents and Hello version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Build
+        run: gem build skaidb.gemspec
+      - name: The gem carries the version the driver announces, and nothing else defines one
+        run: |
+          set -e
+          ver="$(ruby -Ilib -e 'require "skaidb"; print Skaidb::VERSION')"
+          test -f "skaidb-$ver.gem" || { echo "::error::gem build produced no skaidb-$ver.gem"; ls; exit 1; }
+          grep -q 'Skaidb::VERSION' skaidb.gemspec || { echo "::error::gemspec must read Skaidb::VERSION"; exit 1; }
+          hello="$(ruby -e 'src = File.read("lib/skaidb.rb"); print src[/def send_hello.*?^    end/m]')"
+          echo "$hello" | grep -q 'Skaidb::VERSION' || { echo "::error::send_hello must derive its version from Skaidb::VERSION"; exit 1; }
+          if echo "$hello" | grep -Eq "[\"'][0-9]+\.[0-9]+\.[0-9]+[\"']"; then echo "::error::send_hello hard-codes a version literal"; exit 1; fi
+          grep -q "## \[$ver\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no entry for $ver"; exit 1; }
+          echo "Hello version source: Skaidb::VERSION = $ver"
+      - name: Installed gem reports the packaged version (and the files it needs)
+        run: |
+          set -e
+          ver="$(ruby -Ilib -e 'require "skaidb"; print Skaidb::VERSION')"
+          gem install --local --no-document "./skaidb-$ver.gem"
+          cd /tmp && ruby -e 'require "skaidb"; puts Skaidb::VERSION' | grep -qx "$ver"
+          gem contents skaidb | grep -E 'lib/skaidb.rb|LICENSE|CHANGELOG.md|README.md'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gem
+          path: '*.gem'

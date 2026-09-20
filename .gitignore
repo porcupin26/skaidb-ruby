@@ -1,0 +1,13 @@
+# gem build output
+*.gem
+pkg/
+tmp/
+
+# bundler / tooling
+.bundle/
+vendor/bundle/
+Gemfile.lock
+.yardoc/
+doc/
+coverage/
+.byebug_history
