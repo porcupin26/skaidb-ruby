@@ -54,13 +54,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.1/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.2/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.0.1.gem`.
+installs without registry access: `gem install ./skaidb-1.0.2.gem`.
 
 ## Quick start
 
@@ -404,7 +404,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.0.1
+-- ruby | 1.0.2
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after
@@ -462,6 +462,22 @@ The end-to-end test in `test/live/` runs against a real server when
 SKAIDB_LIVE=1 SKAIDB_HOST=127.0.0.1 SKAIDB_PORT=7000 SKAIDB_USER=admin SKAIDB_PASSWORD=secret \
 SKAIDB_DATABASE=default rake test:live
 ```
+
+### Releasing
+
+A release is a tag. Bump `Skaidb::VERSION` in `lib/skaidb.rb`, add the
+`## [x.y.z]` entry to `CHANGELOG.md`, commit, then tag and push:
+
+```sh
+git tag v1.2.3 && git push origin main v1.2.3
+```
+
+[`publish.yml`](https://github.com/porcupin26/skaidb-ruby/blob/main/.github/workflows/publish.yml)
+then runs the tests, checks the tag against `Skaidb::VERSION`, builds the
+gem, pushes it to [RubyGems.org](https://rubygems.org/gems/skaidb) with the
+`RUBYGEMS_API_KEY` repository secret (a rubygems.org API key with the push
+scope; without the secret the push is skipped with a notice) and creates the
+GitHub Release with the `.gem` attached.
 
 ## License
 

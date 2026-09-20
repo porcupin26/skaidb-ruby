@@ -4,6 +4,19 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-09-20
+
+Release automation: published from GitHub Actions. No code change.
+
+### Changed
+- A `v*` tag pushed to GitHub publishes that version by itself
+  (`.github/workflows/publish.yml`, GitHub-hosted runner): tests, the
+  tag-equals-`Skaidb::VERSION` check, `gem build`, `gem push` to RubyGems.org
+  with the `RUBYGEMS_API_KEY` repository secret, then the GitHub Release with
+  the `.gem` attached. Without the secret the push is skipped with a notice;
+  a version rubygems.org already lists is skipped too, so re-running a tag's
+  workflow is safe.
+
 ## [1.0.1] - 2026-09-20
 
 Published to RubyGems.org as [`skaidb`](https://rubygems.org/gems/skaidb).
@@ -90,5 +103,6 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.0.2]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-ruby/releases/tag/v1.0.0

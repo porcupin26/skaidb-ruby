@@ -1,11 +1,25 @@
 name: Publish
 
-# Runs on every v* tag: checks the tag against the package version, builds
-# the gem, attaches it to a GitHub Release for the tag, and pushes it to
-# RubyGems.org only when the RUBYGEMS_API_KEY repository secret exists.
-# Without the secret the push is skipped with a notice and the gem is pushed
-# by hand (GEM_HOST_API_KEY=… gem push skaidb-<version>.gem); the release
-# asset mirrors what is on https://rubygems.org/gems/skaidb.
+# Pushing a version tag (v1.2.3) publishes that version by itself, on a
+# GitHub-hosted runner:
+#   1. unit tests (in-process fake server, no skaidb needed),
+#   2. the tag must equal Skaidb::VERSION (lib/skaidb.rb, the one place the
+#      version is defined; the gemspec reads it),
+#   3. gem build skaidb.gemspec,
+#   4. gem push to https://rubygems.org/gems/skaidb, authenticated with the
+#      RUBYGEMS_API_KEY repository secret (Settings → Secrets and variables →
+#      Actions), which `gem push` reads as GEM_HOST_API_KEY. Without the
+#      secret the push is skipped with a notice and the run still succeeds
+#      (push by hand: GEM_HOST_API_KEY=… gem push skaidb-<version>.gem). A
+#      version rubygems.org already lists is skipped too, so re-running the
+#      tag's workflow is safe,
+#   5. a GitHub Release for the tag, notes taken from CHANGELOG.md, with the
+#      built .gem attached for installs without registry access.
+#
+# The secret is a rubygems.org API key with the "Push rubygems" scope, made at
+# https://rubygems.org/profile/api_keys by an owner of the gem, from an account
+# whose MFA level is "UI and gem signin" ("UI and API" demands an OTP on every
+# push and cannot run unattended).
 
 on:
   push:
@@ -46,19 +60,44 @@ jobs:
           ' CHANGELOG.md > release-notes.md
           if [ ! -s release-notes.md ]; then echo "Release $VERSION" > release-notes.md; fi
           printf '\n---\nInstall: `gem install skaidb` (https://rubygems.org/gems/skaidb), or `gem "skaidb", "~> 1.0"` in a Gemfile. The built `skaidb-%s.gem` is attached below for installs without registry access (`gem install ./skaidb-%s.gem`).\n' "$VERSION" "$VERSION" >> release-notes.md
+      - name: Push to RubyGems.org (skipped without the RUBYGEMS_API_KEY secret, or when the version is already there)
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          listed() {  # succeeds when rubygems.org lists skaidb $1
+            curl -fsS -o "$RUNNER_TEMP/versions.json" https://rubygems.org/api/v1/versions/skaidb.json 2>/dev/null || return 1
+            ruby -rjson -e 'exit JSON.parse(File.read(ARGV[0])).any? { |v| v["number"] == ARGV[1] }' "$RUNNER_TEMP/versions.json" "$1"
+          }
+          if [ -z "$GEM_HOST_API_KEY" ]; then
+            echo "::notice title=RubyGems push skipped::RUBYGEMS_API_KEY secret is not set; nothing was pushed. Add it under Settings → Secrets and variables → Actions (a rubygems.org API key with the push scope), or push by hand: GEM_HOST_API_KEY=… gem push skaidb-$VERSION.gem (https://rubygems.org/gems/skaidb)"
+            echo "RubyGems.org: push skipped, the RUBYGEMS_API_KEY secret is not set" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if listed "$VERSION"; then
+            echo "::notice title=RubyGems push skipped::skaidb $VERSION is already on rubygems.org; nothing was pushed"
+            echo "RubyGems.org: already lists skaidb $VERSION, nothing pushed" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # stdin closed and a hard timeout: an OTP prompt cannot hang the job
+          timeout 300 gem push "skaidb-$VERSION.gem" < /dev/null
+          for _ in $(seq 1 24); do
+            if listed "$VERSION"; then
+              echo "rubygems.org lists skaidb $VERSION"
+              echo "RubyGems.org: pushed skaidb $VERSION — https://rubygems.org/gems/skaidb/versions/$VERSION" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::gem push succeeded but https://rubygems.org/api/v1/versions/skaidb.json does not list $VERSION yet (the index can lag a few minutes)"
+          echo "RubyGems.org: pushed skaidb $VERSION (the index had not caught up when the run checked)" >> "$GITHUB_STEP_SUMMARY"
       - name: GitHub Release with the gem attached
+        id: gh_release
         uses: softprops/action-gh-release@v2
         with:
           name: v${{ env.VERSION }}
           body_path: release-notes.md
           files: skaidb-${{ env.VERSION }}.gem
           fail_on_unmatched_files: true
-      - name: Push to RubyGems.org (only when RUBYGEMS_API_KEY is set)
-        env:
-          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+      - name: Summary
         run: |
-          if [ -z "$GEM_HOST_API_KEY" ]; then
-            echo "::notice title=RubyGems push skipped::RUBYGEMS_API_KEY secret is not set; nothing was pushed. Push by hand: GEM_HOST_API_KEY=… gem push skaidb-$VERSION.gem (https://rubygems.org/gems/skaidb)"
-            exit 0
-          fi
-          gem push "skaidb-$VERSION.gem"
+          echo "GitHub Release: ${{ steps.gh_release.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
