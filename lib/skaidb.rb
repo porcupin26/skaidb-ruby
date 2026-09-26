@@ -34,7 +34,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.0.3"
+  VERSION = "1.1.0"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -70,6 +70,29 @@ module Skaidb
       else
         raise Error, "invalid consistency #{value.inspect}"
       end
+    end
+  end
+
+  # Login mechanisms (the optional last byte of AuthStart, PROTOCOL.md §2.4).
+  module AuthMechanism
+    # SCRAM-SHA-256 with +user+ / +password+ (the default).
+    SCRAM = :scram
+    # EXTERNAL: the TLS client certificate is the credential.
+    CERTIFICATE = :certificate
+
+    WIRE = { SCRAM => 0, CERTIFICATE => 2 }.freeze
+    ALIASES = {
+      "scram" => SCRAM, "password" => SCRAM,
+      "certificate" => CERTIFICATE, "external" => CERTIFICATE, "x509" => CERTIFICATE
+    }.freeze
+
+    # Resolve +:scram+ / +:certificate+ (or a String, or an alias:
+    # "password", "external", "x509") into +:scram+ or +:certificate+.
+    def self.resolve(value)
+      m = ALIASES[value.to_s.downcase] if value.is_a?(String) || value.is_a?(Symbol)
+      return m if m
+
+      raise Error, "unknown auth_mechanism #{value.inspect} (use :scram or :certificate)"
     end
   end
 
@@ -490,12 +513,25 @@ module Skaidb
 
   # ---- SCRAM-SHA-256 (§2) --------------------------------------------------
 
+  # The SaltedPassword: PBKDF2-HMAC-SHA-256 of the UTF-8 password, 32 bytes.
+  def self.salted_password(password, salt, iterations)
+    OpenSSL::KDF.pbkdf2_hmac(
+      password.to_s.dup.force_encoding("UTF-8"), salt: salt, iterations: iterations, length: 32, hash: "sha256"
+    )
+  end
+
+  # The AuthMessage both sides sign: username, client nonce, server nonce,
+  # lowercase-hex salt and decimal iteration count, joined with NUL bytes.
+  def self.auth_message(username, client_nonce, server_nonce, salt, iterations)
+    [username, client_nonce, server_nonce, salt.unpack1("H*"), iterations.to_s]
+      .map { |part| part.to_s.dup.force_encoding("UTF-8") }
+      .join("\0")
+  end
+
   # Compute the client proof and the expected server signature.
   def self.scram(password, salt, iterations, auth_message)
     digest = OpenSSL::Digest::SHA256
-    salted = OpenSSL::KDF.pbkdf2_hmac(
-      password, salt: salt, iterations: iterations, length: 32, hash: "sha256"
-    )
+    salted = salted_password(password, salt, iterations)
     client_key = OpenSSL::HMAC.digest(digest.new, salted, "Client Key")
     stored_key = OpenSSL::Digest::SHA256.digest(client_key)
     client_sig = OpenSSL::HMAC.digest(digest.new, stored_key, auth_message)
@@ -525,6 +561,23 @@ module Skaidb
     [bytes].pack("V") + b.b
   end
 
+  # AuthStart for the certificate login (mechanism EXTERNAL): username (may
+  # be empty), an empty client nonce, mechanism byte 2.
+  def self.certificate_auth_start(user)
+    [10].pack("C") + enc_str(user) + enc_str("") + [AuthMechanism::WIRE[AuthMechanism::CERTIFICATE]].pack("C")
+  end
+
+  # Check the AuthOutcome that answers a certificate AuthStart: returns on
+  # Ok (the signature is deliberately not checked), raises ConnectionError
+  # with the server's reason on Denied.
+  def self.parse_certificate_outcome(payload)
+    r = Reader.new(payload)
+    raise ConnectionError, "bad handshake outcome" unless r.u8 == 13
+    raise ConnectionError, "authentication denied: #{r.text}" unless r.u8 == 1
+
+    nil
+  end
+
   # ---- Result --------------------------------------------------------------
 
   # A query result, shaped like +PG::Result+. Enumerable over row Hashes
@@ -543,8 +596,15 @@ module Skaidb
     #   whose body EMITted), in order; this Result is the LAST of them.
     #   Empty for an ordinary single-set reply.
     attr_reader :result_sets
+    # @return [Symbol] what the server answered: +:rows+ (a result set, or
+    #   several — see +result_sets+), +:mutation+ (an affected-row count in
+    #   +cmd_tuples+), +:ddl+ (a bare acknowledgement: no rows, no count), or
+    #   +:stream+ (returned by Connection#stream once every row was yielded:
+    #   +fields+ holds the column names, +rows+ is empty).
+    attr_reader :kind
 
-    def initialize(fields:, rows:, cmd_tuples: 0, result_sets: [])
+    def initialize(fields:, rows:, cmd_tuples: 0, result_sets: [], kind: :rows)
+      @kind = kind
       @result_sets = result_sets
       @fields = fields
       @rows = rows
@@ -620,8 +680,17 @@ module Skaidb
 
     def initialize(host:, port:, user:, password:, consistency:, timeout:,
                    database: nil, tls: false, tls_ca: nil, tls_insecure: false,
-                   tls_server_name: "skaidb", seeds: nil)
+                   tls_server_name: "skaidb", seeds: nil, tls_client_cert: nil,
+                   tls_client_key: nil, auth_mechanism: :scram)
       @consistency = Consistency.resolve(consistency)
+      @auth_mechanism = AuthMechanism.resolve(auth_mechanism)
+      if tls_client_cert.to_s.empty? != tls_client_key.to_s.empty?
+        raise Error, "tls_client_cert and tls_client_key go together"
+      end
+      if @auth_mechanism == AuthMechanism::CERTIFICATE && (!tls || tls_client_cert.to_s.empty?)
+        raise Error, "certificate authentication needs TLS with a client certificate " \
+                     "(tls_client_cert: and tls_client_key:)"
+      end
       @mutex = Mutex.new
       @closed = false
       # Transport died; the next statement re-dials (see ensure_live!).
@@ -634,7 +703,8 @@ module Skaidb
       @dial_args = { host: host, port: port, user: user, password: password,
                      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
                      tls_insecure: tls_insecure, tls_server_name: tls_server_name,
-                     seeds: seeds }
+                     seeds: seeds, tls_client_cert: tls_client_cert,
+                     tls_client_key: tls_client_key }
       dial!
     end
 
@@ -666,8 +736,15 @@ module Skaidb
         begin
           @sock = Socket.tcp(h, prt, connect_timeout: timeout)
           @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
-          @sock = tls_wrap(@sock, tls_ca, tls_insecure, tls_server_name) if tls
-          handshake(user.to_s, password.to_s)
+          if tls
+            @sock = tls_wrap(@sock, tls_ca, tls_insecure, tls_server_name,
+                             @dial_args[:tls_client_cert], @dial_args[:tls_client_key])
+          end
+          if @auth_mechanism == AuthMechanism::CERTIFICATE
+            handshake_certificate(user.to_s)
+          else
+            handshake(user.to_s, password.to_s)
+          end
           last = nil
           break
         rescue StandardError => e
@@ -710,8 +787,16 @@ module Skaidb
     # unreachable. +tls_server_name+ must match a SAN on the server
     # certificate — skaidb's own certs carry DNS:skaidb, which is usually NOT
     # the address dialled.
-    def tls_wrap(sock, ca_file, insecure, server_name)
+    #
+    # +client_cert+ / +client_key+ (PEM files) present a client certificate in
+    # the TLS handshake: the credential of the certificate login, and what a
+    # server that verifies client certificates asks for.
+    def tls_wrap(sock, ca_file, insecure, server_name, client_cert = nil, client_key = nil)
       ctx = OpenSSL::SSL::SSLContext.new
+      if client_cert && !client_cert.to_s.empty?
+        ctx.cert = OpenSSL::X509::Certificate.new(File.read(client_cert))
+        ctx.key = OpenSSL::PKey.read(File.read(client_key))
+      end
       if insecure
         # Encrypts, but authenticates nothing: a man in the middle can present
         # any certificate. Development only.
@@ -845,6 +930,12 @@ module Skaidb
     # the whole stream), which is what keeps it out of the pool. Iterate with
     # a block or +each+ if you mean to reuse the connection.
     #
+    # With a block it returns a Result once the stream ends: for a row stream
+    # +kind+ is +:stream+ and +fields+ holds the column names (known even when
+    # no row arrived) while +rows+ stays empty — the rows went to the block;
+    # a statement that produces no rows returns its ordinary +:mutation+ or
+    # +:ddl+ Result without yielding.
+    #
     # Takes no parameters — the streaming opcode carries SQL text.
     def stream(sql, consistency: nil)
       return enum_for(:stream, sql, consistency: consistency) unless block_given?
@@ -855,6 +946,7 @@ module Skaidb
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [5, level].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
       live = false
+      summary = nil
       @mutex.synchronize do
         write_frame(req)
         r = Reader.new(read_frame)
@@ -863,8 +955,10 @@ module Skaidb
         when 3
           msg = r.text
           raise QueryError, msg.include?("unknown opcode") ? "server does not support streaming: #{msg}" : msg
-        when 1, 2
-          return nil # not row-producing
+        when 1
+          return Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation) # not row-producing
+        when 2
+          return Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
         when 5
           # The server has already committed to a row stream, so from here
           # the socket carries frames this call owns — mark it BEFORE
@@ -879,6 +973,7 @@ module Skaidb
           live = true
           @streaming = true
           cols = Array.new(r.u32) { r.text }
+          summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
           begin
             while live
               fr = Reader.new(read_frame)
@@ -914,7 +1009,7 @@ module Skaidb
           raise QueryError, "unexpected response tag #{tag} to stream request"
         end
       end
-      nil
+      summary
     end
 
     # Prepare +sql+ on the SERVER, returning [id, nparams], or nil when the
@@ -1143,9 +1238,7 @@ module Skaidb
       iterations = r.u32
       server_nonce = r.text
 
-      salt_hex = salt.unpack1("H*") # lowercase hex
-      auth_message = [user, client_nonce, server_nonce, salt_hex, iterations.to_s]
-                     .join("\0").dup.force_encoding("UTF-8")
+      auth_message = Skaidb.auth_message(user, client_nonce, server_nonce, salt, iterations)
       proof, expected_sig = Skaidb.scram(password, salt, iterations, auth_message)
 
       write_frame([12].pack("C") + proof) # 32 raw bytes, not length-prefixed
@@ -1161,6 +1254,17 @@ module Skaidb
       else
         raise ConnectionError, "authentication denied: #{r.text}"
       end
+    end
+
+    # EXTERNAL (PROTOCOL.md §2.4): the TLS client certificate is the
+    # credential, its Common Name the username; +user+ may be empty or must
+    # equal it. AuthStart carries an empty client nonce and mechanism byte 2,
+    # and the server answers AuthOutcome at once. The outcome's 32-byte
+    # signature is NOT verified — there is no shared secret to verify it
+    # with; TLS already authenticated the server.
+    def handshake_certificate(user)
+      write_frame(Skaidb.certificate_auth_start(user))
+      Skaidb.parse_certificate_outcome(read_frame)
     end
 
     # -- query --
@@ -1205,9 +1309,9 @@ module Skaidb
         last = sets.last || Result.new(fields: [], rows: [], cmd_tuples: 0)
         Result.new(fields: last.fields, rows: last.rows, cmd_tuples: 0, result_sets: sets)
       when 1 # Mutation
-        Result.new(fields: [], rows: [], cmd_tuples: r.u64)
+        Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation)
       when 2 # Ddl
-        Result.new(fields: [], rows: [], cmd_tuples: 0)
+        Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
       when 3 # Error — a statement error, connection stays usable
         raise QueryError, r.text
       else
@@ -1226,18 +1330,31 @@ module Skaidb
   # @param password [String]
   # @param consistency [Symbol, String, Integer] :one / :quorum / :all (or 0/1/2)
   # @param timeout [Numeric, nil] connect/IO timeout in seconds
+  # @param tls_client_cert [String, nil] PEM file of a client certificate to
+  #   present over TLS (with +tls_client_key+); turns TLS on
+  # @param tls_client_key [String, nil] PEM file of its private key
+  # @param auth_mechanism [Symbol, String] +:scram+ (user + password, the
+  #   default) or +:certificate+ (the client certificate is the login; +user+
+  #   is optional and, when given, must equal the certificate's Common Name)
   # @yield [conn] optional block; the connection is closed when it returns
   # @return [Connection] (or the block's value when a block is given)
-  def self.connect(host: "localhost", port: 7000, user: "anonymous",
+  def self.connect(host: "localhost", port: 7000, user: nil,
                    password: "", consistency: :quorum, timeout: 10.0,
                    database: nil, tls: false, tls_ca: nil, tls_insecure: false,
-                   tls_server_name: "skaidb", seeds: nil)
-    tls = true if tls_ca || tls_insecure
+                   tls_server_name: "skaidb", seeds: nil, tls_client_cert: nil,
+                   tls_client_key: nil, auth_mechanism: :scram)
+    tls = true if tls_ca || tls_insecure || tls_client_cert
+    # A SCRAM login with no user is "anonymous"; a certificate login with no
+    # user sends an empty one and lets the certificate's CN decide.
+    user = "anonymous" if user.nil? && AuthMechanism.resolve(auth_mechanism) == AuthMechanism::SCRAM
     conn = Connection.new(host: host, port: port, user: user,
                           password: password, consistency: consistency,
                           timeout: timeout, database: database, tls: tls,
                           tls_ca: tls_ca, tls_insecure: tls_insecure,
-                          tls_server_name: tls_server_name, seeds: seeds)
+                          tls_server_name: tls_server_name, seeds: seeds,
+                          tls_client_cert: tls_client_cert,
+                          tls_client_key: tls_client_key,
+                          auth_mechanism: auth_mechanism)
     return conn unless block_given?
 
     begin

@@ -4,6 +4,38 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-26
+
+### Added
+- Certificate login (wire mechanism EXTERNAL): `auth_mechanism: :certificate`
+  with `tls_client_cert:` / `tls_client_key:` (PEM files). AuthStart carries
+  the optional user, an empty client nonce and mechanism byte 2; the
+  outcome's signature is not verified, since TLS authenticated the server.
+  `user:` is optional under it and, when given, must equal the certificate's
+  Common Name. `Skaidb::AuthMechanism` resolves the option.
+- `tls_client_cert:` / `tls_client_key:` also present a client certificate
+  under SCRAM, for servers that verify client certificates; either turns TLS
+  on, and they must be given together.
+- The shared wire-protocol conformance suite: `conformance/vectors.json` and
+  its contract, vendored byte-identical, run by `test/conformance_test.rb`
+  (values, SCRAM, auth outcomes, every case through the public API; nothing
+  skipped). CI fails when the vendored vectors differ from
+  https://skaidb.org/conformance/vectors.json.
+- `Result#kind` (`:rows`, `:mutation`, `:ddl`, `:stream`): a DDL
+  acknowledgement was indistinguishable from "0 rows affected".
+- `Skaidb.salted_password` and `Skaidb.auth_message`, the SCRAM pieces the
+  handshake uses, so they can be checked against the reference vectors.
+
+### Changed
+- `Connection#stream` with a block returns a `Result` instead of `nil`. Found
+  by the conformance suite: a stream with no rows had no way to report its
+  column names, and a non-row statement sent over the streaming opcode
+  dropped its affected-row count. A row stream now returns `kind: :stream`
+  with the column names in `fields`; a non-row statement returns its
+  `:mutation` (with `cmd_tuples`) or `:ddl` Result.
+- `Skaidb.connect`'s `user:` defaults to `nil`, which still means
+  `"anonymous"` under SCRAM and an empty user under certificate login.
+
 ## [1.0.3] - 2026-09-20
 
 Release automation: published from GitHub Actions. No code change.

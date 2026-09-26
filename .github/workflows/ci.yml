@@ -26,6 +26,14 @@ jobs:
           done
       - name: Unit tests (minitest from the stdlib, in-process fake server, no skaidb needed)
         run: ruby -w -Ilib -Itest -e 'Dir["test/*_test.rb"].sort.each { |f| require File.expand_path(f) }'
+      - name: Conformance vectors match the published suite
+        if: matrix.ruby == '3.3'
+        run: |
+          curl -fsSL https://skaidb.org/conformance/vectors.json -o "$RUNNER_TEMP/published.json"
+          if ! cmp -s "$RUNNER_TEMP/published.json" conformance/vectors.json; then
+            echo "::error::conformance/vectors.json differs from https://skaidb.org/conformance/vectors.json — copy the published file in and make the tests pass"
+            exit 1
+          fi
       - name: Live test is skipped without a server (never fails CI)
         run: ruby -Ilib test/live/live_test.rb
       - name: Package builds

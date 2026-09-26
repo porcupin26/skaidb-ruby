@@ -8,7 +8,7 @@ Everything lives under the `Skaidb` module in `lib/skaidb.rb`.
 |---|---|---|
 | `host` | `"localhost"` | Node to dial (ignored when `seeds` is given). |
 | `port` | `7000` | Binary-protocol port; also the port for a seed without one. |
-| `user` | `"anonymous"` | SCRAM user name. |
+| `user` | `"anonymous"` (SCRAM), `""` (certificate) | User name. Under `auth_mechanism: :certificate` it is optional and, when given, must equal the certificate's Common Name. |
 | `password` | `""` | SCRAM password. Empty skips server-signature verification (anonymous connect). |
 | `consistency` | `:quorum` | Default level for every statement: `:one`, `:quorum`, `:all`, `"ONE"`…, or `0`/`1`/`2`. |
 | `timeout` | `10.0` | TCP connect timeout in seconds; `nil` for none. Reads are not bounded. |
@@ -18,12 +18,18 @@ Everything lives under the `Skaidb` module in `lib/skaidb.rb`.
 | `tls_ca` | `nil` | PEM file to trust instead of the system store; implies `tls`. |
 | `tls_insecure` | `false` | TLS without any certificate verification; implies `tls`. Development only. |
 | `tls_server_name` | `"skaidb"` | SNI name, also checked against the certificate's SANs. |
+| `tls_client_cert` | `nil` | PEM file of a client certificate to present in the TLS handshake; implies `tls`. Needs `tls_client_key`. |
+| `tls_client_key` | `nil` | PEM file of that certificate's private key. |
+| `auth_mechanism` | `:scram` | `:scram` (user + password) or `:certificate` (the client certificate is the login, wire mechanism EXTERNAL; needs `tls_client_cert`/`tls_client_key`). Strings and the aliases `"password"`, `"external"`, `"x509"` are accepted. |
 
 With a block, yields the connection and closes it when the block returns
 (the block's value is returned). Raises `Skaidb::ConnectionError` when no
 endpoint accepts the handshake (`no reachable endpoint in …: <last error>`),
 `authentication denied: …` on a wrong password, and
 `server signature mismatch` when the server fails mutual authentication.
+Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
+`tls_client_cert` without its `tls_client_key` (or the reverse), and
+`:certificate` without a client certificate.
 
 ## `Skaidb::Connection`
 
@@ -49,8 +55,11 @@ endpoint accepts the handshake (`no reachable endpoint in …: <last error>`),
 - `prepare_server(sql) → [id, nparams] | nil` — prepare a statement with `?`
   placeholders on the server; `nil` when the server refuses. Cached per
   connection (240 entries); the cache is cleared on re-dial.
-- `stream(sql, consistency: nil) { |row| … } → nil` — see
-  [streaming.md](streaming.md). Without a block returns an Enumerator.
+- `stream(sql, consistency: nil) { |row| … } → Result` — see
+  [streaming.md](streaming.md). For a row stream the returned Result has
+  `kind == :stream`, the column names in `fields` and no `rows` (they went to
+  the block); a statement without rows returns its `:mutation` / `:ddl`
+  Result without yielding. Without a block returns an Enumerator.
 - `subscribe(stream_name, after: nil, poll: 0.5) { |event| … }` — yields a
   `CREATE STREAM` log's events forever, each a Hash with `"id"`, `"op"`,
   `"k"`, `"ts"`, `"doc"`. Polls `_stream_<name>` 500 rows at a time with a
@@ -91,6 +100,7 @@ Shaped like `PG::Result`; `Enumerable` over row Hashes.
 | `[i]` | Row `i` as a Hash, or `nil`. |
 | `getvalue(row, col)` | One cell; `col` is an index or a column name. |
 | `cmd_tuples` | Rows affected by `INSERT`/`UPDATE`/`DELETE`; `0` for `SELECT` and DDL. |
+| `kind` | What the server answered: `:rows` (a result set, or several in `result_sets`), `:mutation` (a count in `cmd_tuples`), `:ddl` (a bare acknowledgement — no rows and no count), `:stream` (the summary `stream` returns). |
 | `result_sets` | For a `CALL` whose body `EMIT`s, every result set in order (each a `Result`); the last one is this result's own `rows`/`fields`. `[]` otherwise. |
 
 ## `Skaidb::Pool`

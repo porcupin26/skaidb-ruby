@@ -77,8 +77,11 @@ class ClientTest < Minitest::Test
 
       m = c.query("INSERT INTO t VALUES (1)")
       assert_equal [3, [], []], [m.cmd_tuples, m.rows, m.fields]
+      assert_equal :mutation, m.kind
       d = c.exec("CREATE TABLE t (PRIMARY KEY (id))")
       assert_equal [0, 0], [d.cmd_tuples, d.ntuples]
+      assert_equal :ddl, d.kind # a bare acknowledgement, told apart from "0 rows affected"
+      assert_equal :rows, r.kind
       e = assert_raises(Skaidb::QueryError) { c.exec("SELECT nope") }
       assert_equal "no such column nope", e.message
       assert c.usable? # a statement error keeps the connection
@@ -180,7 +183,10 @@ class ClientTest < Minitest::Test
       c = connect(srv)
       seen = []
       ret = c.stream("SELECT * FROM big") { |row| seen << row }
-      assert_nil ret
+      # the rows went to the block; the returned Result carries the columns
+      assert_equal :stream, ret.kind
+      assert_equal %w[id v], ret.fields
+      assert_empty ret.rows
       assert_equal [{ "id" => 1, "v" => "a" }, { "id" => 2, "v" => "b" }, { "id" => 3, "v" => "c" }], seen
       assert c.usable?
       # Enumerator form; abandoning early drains the rest so the next request is clean
@@ -191,7 +197,9 @@ class ClientTest < Minitest::Test
       c.stream("SELECT * FROM big") { |_row| break }
       assert_equal 1, c.exec("SELECT 1")[0]["c"]
       # a non-row statement over the streaming opcode
-      assert_nil c.stream("INSERT INTO t VALUES (1)") { |_| flunk "no rows expected" }
+      res = c.stream("INSERT INTO t VALUES (1)") { |_| flunk "no rows expected" }
+      assert_equal :mutation, res.kind
+      assert_equal 1, res.cmd_tuples
       # an error after the header ends the stream; rows before it were valid
       got = []
       e = assert_raises(Skaidb::QueryError) { c.stream("SELECT boom") { |r| got << r } }

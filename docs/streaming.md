@@ -13,11 +13,14 @@ end
 ```
 
 - `stream(sql, consistency: nil)` takes SQL text only — no parameters.
-- With a block it returns `nil` after the last row.
+- With a block it returns a `Skaidb::Result` after the last row: `kind` is
+  `:stream`, `fields` holds the column names (known even when no row
+  arrived), and `rows` is empty because the rows went to the block.
 - Without a block it returns an Enumerator: `conn.stream(sql).first(10)`,
   `.each_slice(1000)`, `.lazy.map { … }`, and the rest of Enumerable work.
 - A non-row statement (an `INSERT`, DDL, `USE`) answers with its ordinary
-  result over the same opcode; `stream` returns `nil` without yielding.
+  result over the same opcode; `stream` returns that Result (`kind`
+  `:mutation` with `cmd_tuples`, or `:ddl`) without yielding.
 - A server without the streaming opcode raises `Skaidb::QueryError`
   (`server does not support streaming: …`).
 

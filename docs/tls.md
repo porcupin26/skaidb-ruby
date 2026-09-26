@@ -42,16 +42,44 @@ OpenSSL's message.
 
 ## What runs inside the session
 
-The TCP connection is upgraded to TLS *before* the SCRAM handshake, so the
+The TCP connection is upgraded to TLS *before* the login handshake, so the
 user name, nonces and proof all travel encrypted; with `seeds:`, each
-endpoint is upgraded and authenticated in turn until one succeeds. The
-driver does not present a client certificate; authentication is SCRAM.
+endpoint is upgraded and authenticated in turn until one succeeds.
+
+## Client certificates
+
+`tls_client_cert:` / `tls_client_key:` (PEM files) make the driver present a
+client certificate in the TLS handshake, which a server with
+`client_tls = "required"` and client verification needs. Either one turns TLS
+on, and they go together. On its own the certificate only opens the TLS
+session; the login is still the SCRAM user.
+
+With `auth_mechanism: :certificate` the certificate IS the login (wire
+mechanism EXTERNAL): the server maps its Common Name to a role and no
+password is sent. The server needs `auth.x509_enabled`, and its client CA
+must have signed the certificate.
+
+```ruby
+conn = Skaidb.connect(host: "db1", tls_ca: "/etc/skaidb/ca.crt",
+                      tls_client_cert: "/etc/app/app.crt",
+                      tls_client_key: "/etc/app/app.key",
+                      auth_mechanism: :certificate, database: "app")
+```
+
+Pass `user:` only to assert the expected identity: a certificate mapped to a
+different role fails the connect. The server's answer carries no signature
+to check — TLS already authenticated the server, so keep `tls_ca:` (or the
+system store) and do not combine a certificate login with `tls_insecure`.
+`Skaidb::Pool` passes these keywords through like the others.
 
 ## Failures
 
 - Wrong CA, expired certificate, name mismatch: `Skaidb::ConnectionError`
   with the OpenSSL message, from `connect` (or from the statement that
   triggered a re-dial).
+- A certificate login the server refuses (no role for the CN, `user:` not
+  matching it, x509 login disabled): `Skaidb::ConnectionError` with
+  `authentication denied: <reason>`.
 - Plain TCP against a `client_tls = required` server: the handshake cannot
   complete, so `connect` raises `Skaidb::ConnectionError`
   (`no reachable endpoint in …`) naming the underlying failure.

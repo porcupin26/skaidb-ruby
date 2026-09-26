@@ -54,13 +54,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.0.3/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.1.0/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.0.3.gem`.
+installs without registry access: `gem install ./skaidb-1.1.0.gem`.
 
 ## Quick start
 
@@ -117,7 +117,9 @@ Skaidb.connect(
   timeout: 10.0,               # TCP connect timeout in seconds; nil = none
   database: nil,               # run USE <database> as part of connecting
   seeds: nil,                  # ["db1", "db2:7000", …] tried in random order
-  tls: false, tls_ca: nil, tls_insecure: false, tls_server_name: "skaidb"
+  tls: false, tls_ca: nil, tls_insecure: false, tls_server_name: "skaidb",
+  tls_client_cert: nil, tls_client_key: nil,   # PEM files: present a client certificate
+  auth_mechanism: :scram       # or :certificate: the client certificate is the login
 ) # => Skaidb::Connection (or the block's value when a block is given)
 ```
 
@@ -163,8 +165,19 @@ conn = Skaidb.connect(host: "db1", tls_insecure: true)            # dev only: no
 
 Any of the three enables TLS. The server name sent as SNI and checked against
 the certificate is `tls_server_name` (default `"skaidb"`, the SAN skaidb's own
-certificates carry). SCRAM runs inside the TLS session. The driver does not
-present a client certificate. Details: [docs/tls.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/tls.md).
+certificates carry). SCRAM runs inside the TLS session.
+
+`tls_client_cert:` / `tls_client_key:` present a client certificate; with
+`auth_mechanism: :certificate` that certificate is the login (its Common Name
+is the user, no password is sent):
+
+```ruby
+conn = Skaidb.connect(host: "db1", tls_ca: "/etc/skaidb/ca.crt",
+                      tls_client_cert: "app.crt", tls_client_key: "app.key",
+                      auth_mechanism: :certificate)
+```
+
+Details: [docs/tls.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/tls.md).
 
 ### Consistency
 
@@ -255,6 +268,8 @@ shaped like `PG::Result`:
   cell by index or column name.
 - `cmd_tuples`: rows affected by `INSERT`/`UPDATE`/`DELETE`; `0` for a
   `SELECT` and for DDL.
+- `kind`: `:rows`, `:mutation` (a count in `cmd_tuples`) or `:ddl` (a bare
+  acknowledgement), which tells "DDL succeeded" from "0 rows affected".
 - `result_sets`: for a `CALL` whose procedure `EMIT`s several result sets,
   every set in order (each a `Result`); the last set is the result's own
   `rows`/`fields`. Empty for an ordinary reply.
@@ -274,8 +289,10 @@ end
 first = conn.stream("SELECT id FROM big ORDER BY id").first(10)   # Enumerator form
 ```
 
-`stream` takes SQL text only (no parameters). A non-row statement returns
-`nil` without yielding.
+`stream` takes SQL text only (no parameters). With a block it returns a
+`Result` whose `kind` is `:stream` and whose `fields` are the column names
+(the rows went to the block); a non-row statement returns its `:mutation` /
+`:ddl` Result without yielding.
 
 **The abandon/drain rule.** The connection is busy for the whole stream:
 a statement from another thread waits for it. Leaving the block early —
@@ -404,7 +421,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.0.3
+-- ruby | 1.1.0
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after
@@ -423,6 +440,30 @@ know the opcode answers with an error the driver ignores.
   specified at <https://skaidb.org/docs/PROTOCOL.html>. The driver speaks the
   binary protocol on port 7000; the server's REST/JSON gateway (port 7080)
   is a dependency-free alternative for other clients.
+
+## Conformance
+
+`test/conformance_test.rb` runs skaidb's shared wire-protocol conformance
+suite, vendored byte-identical from the server repository in
+[`conformance/`](https://github.com/porcupin26/skaidb-ruby/tree/main/conformance)
+(`vectors.json` plus the contract in its `README.md`), as part of `rake test`:
+
+- every value vector decodes to the expected Ruby value and encodes back to
+  the reference bytes (a Uuid cell is compared as its canonical String, the
+  form the driver returns);
+- every SCRAM vector (auth message, salted password, client proof, server
+  signature) through the driver's own SCRAM code;
+- the auth outcomes against a fake server that verifies the client proof
+  independently: `ok` connects, a server signature that does not verify
+  fails the connect, `denied` fails with the server's reason;
+- every case through the public API (`exec`, `stream`, `exec_params`,
+  `exec_batch`, and sequences of them on one connection), checking the exact
+  request bytes and the decoded result. The vectors' `?` placeholders are
+  passed as this driver's `$1`, `$2`, ….
+
+Nothing is skipped: the test prints `skipped call methods: none`. CI also
+fails when the vendored `vectors.json` differs from the published
+<https://skaidb.org/conformance/vectors.json>.
 
 ## Examples
 
