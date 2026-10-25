@@ -4,6 +4,32 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-10-25
+
+### Added
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1): `load_balancing: :round_robin` /
+  `:least_latency` (power of two choices on the round-trip average ×
+  checked-out connections, re-measuring a member not used in the last 2 s;
+  `:random` stays the default), `idle_order: :fifo`, health ejection
+  (consecutive transport failures, or a latency average far above the other
+  members') with a background probe that re-admits the member,
+  `discover: true` (members from `SHOW ENDPOINTS`, server ≥ 0.327: joiners
+  added, leavers dropped, resyncing/unreachable members skipped and
+  re-checked every 5 s), and `read_your_writes: <seconds>` with
+  `checkout(affinity: key)` / `with(affinity: key)` — reads follow the member
+  that took the key's last write. `pool.members` reports each member's
+  state, latency and connections; `logger:` is told of ejections and
+  re-admissions. Options take Symbols or Strings.
+- `Connection#endpoint`: the `"host:port"` of the member a connection reached.
+
+### Changed
+- A pooled connection that re-dials does so in the pool's order (usable
+  members first, the one it lost last) instead of shuffling the seeds.
+- `Skaidb::Pool.new` checks its `Skaidb.connect` keywords when it is created
+  instead of at the first checkout, and a connection checked in to a pool
+  that did not create it is closed instead of kept.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added
@@ -148,6 +174,8 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.2.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.0...v1.0.1

@@ -13,7 +13,8 @@ and the result behaves like `PG::Result`. **Pure standard library** (`socket`,
 Ruby 2.7 through 3.4. It speaks skaidb's binary protocol directly:
 SCRAM-SHA-256 authentication, server-side prepared statements with typed
 parameters, one-round-trip batches, streamed result sets, multi-seed failover,
-transparent reconnect, TLS and connection pooling.
+transparent reconnect, TLS and a connection pool that balances across the
+cluster's members.
 
 - Repository: <https://github.com/porcupin26/skaidb-ruby>
 - RubyGems: <https://rubygems.org/gems/skaidb>
@@ -54,13 +55,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.1.0/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.2.0/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.1.0.gem`.
+installs without registry access: `gem install ./skaidb-1.2.0.gem`.
 
 ## Quick start
 
@@ -98,7 +99,8 @@ end
   prepared statements, `exec_batch`
 - [Results](#results)
 - [Streaming large results](#streaming-large-results)
-- [Connection pool](#connection-pool)
+- [Connection pool](#connection-pool) — balancing across members,
+  health ejection, discovery, read-your-writes
 - [Streams (`CREATE STREAM`)](#streams-create-stream) — `subscribe`
 - [Type mapping](#type-mapping)
 - [Errors](#errors)
@@ -321,7 +323,29 @@ pool.close                                    # closes idle connections
 blocks — when no idle connection is available a new one is dialed, and a
 returned connection beyond `maxsize` is closed. Connections are validated with
 `usable?` on checkout and check-in, so one broken by a transport error or an
-undrained stream is closed and replaced. Details: [docs/pooling.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/pooling.md).
+undrained stream is closed and replaced.
+
+The pool spreads its connections across the members by the rules every skaidb
+driver shares
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):
+
+```ruby
+pool = Skaidb::Pool.new(seeds: ["db1", "db2", "db3"], database: "app",
+                        load_balancing: :least_latency, # or :round_robin; :random is the default
+                        discover: true,                 # members from SHOW ENDPOINTS, resyncing ones skipped
+                        read_your_writes: 2.0)          # seconds; see affinity below
+
+pool.with(affinity: user_id) { |conn| conn.exec_params("INSERT INTO notes (id, owner) VALUES ($1, $2)", [nid, user_id]) }
+pool.with(affinity: user_id) { |conn| conn.exec_params("SELECT * FROM notes WHERE id = $1", [nid]) } # same member
+
+pool.members # => [{ endpoint: "db1:7000", canonical: "10.0.0.1:7000", state: :ready,
+             #      latency_ms: 0.8, in_use: 2, idle: 3, seed: true }, …]
+```
+
+A member with consecutive transport failures, or a round-trip average far
+above the others', is ejected and re-admitted by a background probe (the last
+usable member never is); `idle_order: :fifo` keeps every idle connection in
+use. Details: [docs/pooling.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/pooling.md).
 
 ## Streams (`CREATE STREAM`)
 
@@ -393,8 +417,9 @@ StandardError
   connection stays usable.
 - A transport failure (`ConnectionError`) marks the connection broken; the
   next statement re-dials, or a pool replaces it.
-- `ArgumentError` for `Pool.new(maxsize: 0)` and for `Skaidb::Uuid.new` of a
-  string that is not a UUID.
+- `ArgumentError` for `Pool.new(maxsize: 0)` or an unknown
+  `load_balancing`/`idle_order`, and for `Skaidb::Uuid.new` of a string that
+  is not a UUID.
 
 ## Transactions
 
@@ -421,7 +446,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.1.0
+-- ruby | 1.2.0
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after
@@ -434,8 +459,9 @@ know the opcode answers with an error the driver ignores.
   `bigdecimal` is declared because it is a bundled gem since Ruby 3.4.
 - Works with any skaidb server. Where a server predates an opcode the driver
   falls back: prepared statements → client-side text binding, `Hello` →
-  ignored. `stream` and `exec_batch` need a server with those opcodes and
-  raise `QueryError` otherwise.
+  ignored, pool discovery (`SHOW ENDPOINTS`, server ≥ 0.327) → the
+  configured seeds. `stream` and `exec_batch` need a server with those
+  opcodes and raise `QueryError` otherwise.
 - The wire protocol (framing, SCRAM handshake, value encoding, opcodes) is
   specified at <https://skaidb.org/docs/PROTOCOL.html>. The driver speaks the
   binary protocol on port 7000; the server's REST/JSON gateway (port 7080)

@@ -34,7 +34,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.1.0"
+  VERSION = "1.2.0"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -677,11 +677,28 @@ module Skaidb
   class Connection
     # @return [Boolean] whether the connection has been closed
     attr_reader :closed
+    # @return [String, nil] the member this connection reached, as the
+    #   "host:port" it dialed (nil until it connects)
+    attr_reader :endpoint
+    # Internal, for Pool: the pool told of this connection's round trips,
+    # transport failures and writes, and asked for the dial order when it
+    # re-dials (nil outside a pool); the member the pool counts it against;
+    # the affinity key it was checked out under; whether it is checked out.
+    attr_accessor :observer, :pool_member, :pool_affinity, :pool_out
 
+    # +endpoints+ and +observer+ are internal, for Pool: an explicit dial
+    # order of [host, port] pairs (no shuffle) and the pool that owns the
+    # connection.
     def initialize(host:, port:, user:, password:, consistency:, timeout:,
                    database: nil, tls: false, tls_ca: nil, tls_insecure: false,
                    tls_server_name: "skaidb", seeds: nil, tls_client_cert: nil,
-                   tls_client_key: nil, auth_mechanism: :scram)
+                   tls_client_key: nil, auth_mechanism: :scram, endpoints: nil,
+                   observer: nil)
+      @observer = observer
+      @endpoint = nil
+      @pool_member = nil
+      @pool_affinity = nil
+      @pool_out = false
       @consistency = Consistency.resolve(consistency)
       @auth_mechanism = AuthMechanism.resolve(auth_mechanism)
       if tls_client_cert.to_s.empty? != tls_client_key.to_s.empty?
@@ -704,7 +721,7 @@ module Skaidb
                      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
                      tls_insecure: tls_insecure, tls_server_name: tls_server_name,
                      seeds: seeds, tls_client_cert: tls_client_cert,
-                     tls_client_key: tls_client_key }
+                     tls_client_key: tls_client_key, endpoints: endpoints }
       dial!
     end
 
@@ -726,11 +743,19 @@ module Skaidb
       # Seeds: try each until one connects AND authenticates — a node that
       # accepts TCP while unhealthy must not swallow the attempt. skaidb is
       # leaderless, so any node serves; the order is shuffled so many
-      # clients spread instead of stampeding the first entry.
-      endpoints = (seeds && !seeds.empty? ? seeds : ["#{host}:#{port}"]).map do |sd|
-        h, _, p = sd.to_s.rpartition(":")
-        h.empty? ? [sd.to_s, port] : [h, p.to_i]
-      end.shuffle
+      # clients spread instead of stampeding the first entry. A pooled
+      # connection dials in the pool's order instead: the member the pool
+      # picked first, and on a re-dial the usable members with the one it
+      # lost last.
+      endpoints = if @observer && @endpoint
+                    @observer.dial_order(@endpoint)
+                  elsif @dial_args[:endpoints]
+                    @dial_args[:endpoints]
+                  else
+                    (seeds && !seeds.empty? ? seeds : ["#{host}:#{port}"]).map do |sd|
+                      Skaidb.parse_endpoint(sd, port)
+                    end.shuffle
+                  end
       last = nil
       endpoints.each do |(h, prt)|
         begin
@@ -745,10 +770,12 @@ module Skaidb
           else
             handshake(user.to_s, password.to_s)
           end
+          @endpoint = "#{h}:#{prt}"
           last = nil
           break
         rescue StandardError => e
           last = e
+          @observer.note_failure("#{h}:#{prt}") if @observer && Skaidb.member_fault?(e)
           begin
             @sock&.close
           rescue StandardError
@@ -848,7 +875,9 @@ module Skaidb
             raise QueryError, "statement expects #{nparams} parameters, got #{order.length}"
           end
 
-          return exec_prepared(id, order, level)
+          res = exec_prepared(id, order, level)
+          note_statement(sql)
+          return res
         end
       end
       text = begin
@@ -890,12 +919,10 @@ module Skaidb
           req << [b.bytesize].pack("V") << b
         end
       end
-      reader = nil
-      @mutex.synchronize do
-        write_frame(req)
-        reader = Reader.new(read_frame)
-      end
-      parse_response(reader).cmd_tuples
+      reader = request(req)
+      n = parse_response(reader).cmd_tuples
+      note_statement(sql)
+      n
     end
 
     # Stream a result set: yields one row Hash at a time while holding a
@@ -948,9 +975,17 @@ module Skaidb
       live = false
       summary = nil
       @mutex.synchronize do
-        write_frame(req)
-        r = Reader.new(read_frame)
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        begin
+          write_frame(req)
+          r = Reader.new(read_frame)
+        rescue ConnectionError
+          observe_failure
+          raise
+        end
+        @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
         tag = r.u8
+        note_statement(sql) unless tag == 3
         case tag
         when 3
           msg = r.text
@@ -1023,11 +1058,7 @@ module Skaidb
 
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
-      reader = nil
-      @mutex.synchronize do
-        write_frame(req)
-        reader = Reader.new(read_frame)
-      end
+      reader = request(req)
       tag = reader.u8
       case tag
       when 4
@@ -1055,11 +1086,7 @@ module Skaidb
         v = Skaidb.encode_value(p)
         req << [v.bytesize].pack("V") << v
       end
-      reader = nil
-      @mutex.synchronize do
-        write_frame(req)
-        reader = Reader.new(read_frame)
-      end
+      reader = request(req)
       parse_response(reader)
     end
 
@@ -1113,6 +1140,9 @@ module Skaidb
       rescue StandardError
         # ignore — socket already gone
       end
+      # Closed while checked out instead of returned: the pool stops
+      # counting it against its member.
+      @observer.note_closed(self) if @observer && @pool_out
       nil
     end
 
@@ -1275,12 +1305,38 @@ module Skaidb
 
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [1, consistency].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
-      reader = nil
-      @mutex.synchronize do
-        write_frame(req)
-        reader = Reader.new(read_frame)
+      reader = request(req)
+      res = parse_response(reader)
+      note_statement(sql)
+      res
+    end
+
+    # One request and its response under the connection mutex. In a pool the
+    # round trip (send to the first response frame) feeds the member's
+    # latency average, and a transport failure counts against the member.
+    def request(req)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      frame = begin
+        @mutex.synchronize do
+          write_frame(req)
+          read_frame
+        end
+      rescue ConnectionError
+        observe_failure
+        raise
       end
-      parse_response(reader)
+      @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+      Reader.new(frame)
+    end
+
+    def observe_failure
+      @observer.note_failure(@endpoint) if @observer && @endpoint
+    end
+
+    # A statement succeeded: a pool with read-your-writes on remembers which
+    # member took a write.
+    def note_statement(sql)
+      @observer&.note_statement(self, sql)
     end
 
     def parse_response(r)
@@ -1338,23 +1394,8 @@ module Skaidb
   #   is optional and, when given, must equal the certificate's Common Name)
   # @yield [conn] optional block; the connection is closed when it returns
   # @return [Connection] (or the block's value when a block is given)
-  def self.connect(host: "localhost", port: 7000, user: nil,
-                   password: "", consistency: :quorum, timeout: 10.0,
-                   database: nil, tls: false, tls_ca: nil, tls_insecure: false,
-                   tls_server_name: "skaidb", seeds: nil, tls_client_cert: nil,
-                   tls_client_key: nil, auth_mechanism: :scram)
-    tls = true if tls_ca || tls_insecure || tls_client_cert
-    # A SCRAM login with no user is "anonymous"; a certificate login with no
-    # user sends an empty one and lets the certificate's CN decide.
-    user = "anonymous" if user.nil? && AuthMechanism.resolve(auth_mechanism) == AuthMechanism::SCRAM
-    conn = Connection.new(host: host, port: port, user: user,
-                          password: password, consistency: consistency,
-                          timeout: timeout, database: database, tls: tls,
-                          tls_ca: tls_ca, tls_insecure: tls_insecure,
-                          tls_server_name: tls_server_name, seeds: seeds,
-                          tls_client_cert: tls_client_cert,
-                          tls_client_key: tls_client_key,
-                          auth_mechanism: auth_mechanism)
+  def self.connect(**options)
+    conn = Connection.new(**connection_options(**options))
     return conn unless block_given?
 
     begin
@@ -1363,67 +1404,257 @@ module Skaidb
       conn.close
     end
   end
-  # A thread-safe pool of connections.
+
+  # Internal: Skaidb.connect's keywords with their defaults applied, as
+  # Connection.new takes them (Pool dials every connection with these).
+  def self.connection_options(host: "localhost", port: 7000, user: nil,
+                              password: "", consistency: :quorum, timeout: 10.0,
+                              database: nil, tls: false, tls_ca: nil, tls_insecure: false,
+                              tls_server_name: "skaidb", seeds: nil, tls_client_cert: nil,
+                              tls_client_key: nil, auth_mechanism: :scram)
+    tls = true if tls_ca || tls_insecure || tls_client_cert
+    # A SCRAM login with no user is "anonymous"; a certificate login with no
+    # user sends an empty one and lets the certificate's CN decide.
+    user = "anonymous" if user.nil? && AuthMechanism.resolve(auth_mechanism) == AuthMechanism::SCRAM
+    { host: host, port: port, user: user, password: password, consistency: consistency,
+      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
+      tls_insecure: tls_insecure, tls_server_name: tls_server_name, seeds: seeds,
+      tls_client_cert: tls_client_cert, tls_client_key: tls_client_key,
+      auth_mechanism: auth_mechanism }
+  end
+
+  # Internal: "host:port", or a bare host on +default_port+, as [host, port].
+  def self.parse_endpoint(text, default_port)
+    h, _, p = text.to_s.rpartition(":")
+    h.empty? ? [text.to_s, default_port] : [h, p.to_i]
+  end
+
+  # Leading keywords of statements that never write: everything else counts
+  # as a write for read-your-writes affinity (a read taken for a write only
+  # keeps the caller on its member a little longer).
+  READ_KEYWORDS = %w[select show explain describe desc values with use].freeze
+  # Whitespace, comments and opening parentheses before the first keyword.
+  STATEMENT_LEAD = %r{\A(?:\s+|\(|--[^\n]*\n?|/\*.*?(?:\*/|\z))*}m.freeze
+  private_constant :READ_KEYWORDS, :STATEMENT_LEAD
+
+  # Internal: whether +sql+ counts as a write for read-your-writes — its
+  # first keyword, after whitespace, comments and opening parentheses, is
+  # none of SELECT, SHOW, EXPLAIN, DESCRIBE, DESC, VALUES, WITH, USE.
+  def self.write_statement?(sql)
+    rest = sql.to_s.b.sub(STATEMENT_LEAD, "")
+    !READ_KEYWORDS.include?(rest[/\A[A-Za-z_]*/].downcase)
+  end
+
+  # Internal: whether a failed dial says something about the member's
+  # health. A refused login is the caller's problem, not the member's —
+  # except a capacity refusal, which is the member being full.
+  def self.member_fault?(error)
+    return true unless error.is_a?(Error) # socket, TLS, timeout
+
+    msg = error.message
+    return msg.include?("too many connections:") if msg.start_with?("authentication denied")
+
+    !msg.start_with?("server signature mismatch")
+  end
+
+  # A thread-safe pool of connections, balanced across the cluster's members.
   #
   # +maxsize+ bounds the connections kept IDLE, not the number checked out: a
   # burst creates extras and the surplus is closed on return. Every keyword
-  # accepted by Skaidb.connect passes through, so pooled connections inherit
-  # seed failover, TLS and the session database.
+  # accepted by Skaidb.connect passes through: +host+/+port+/+seeds+ name the
+  # starting members, and the rest (TLS, the session database, ...) apply to
+  # every connection.
   #
-  #   pool = Skaidb::Pool.new(seeds: ["h1:7000", "h2:7000"], database: "app", maxsize: 8)
+  # Load balancing (PROTOCOL.md §6.1, the same in every skaidb driver; see
+  # docs/pooling.md):
+  #
+  # - +load_balancing+ — +:random+ (default: each new connection dials the
+  #   members in random order), +:round_robin+ (checkouts rotate over the
+  #   members) or +:least_latency+ (of two members picked at random, the one
+  #   with the lower latency average x checked-out connections).
+  # - +idle_order+ — +:lifo+ (default: the most recently returned idle
+  #   connection first) or +:fifo+ (the longest idle first, so every idle
+  #   connection keeps getting used).
+  # - +discover+ — read the members from SHOW ENDPOINTS (server >= 0.327)
+  #   when a member is first reached and every +refresh_interval+ seconds
+  #   after (every 5 s while one is not ready): joiners are added, leavers
+  #   dropped, and members reported +resyncing+ or +unreachable+ get no new
+  #   connections until they are +ready+ again.
+  # - Health ejection: a member with +eject_errors+ consecutive transport
+  #   failures, or whose latency average is above +eject_latency_factor+
+  #   times the other members' median and more than +eject_latency_floor+
+  #   seconds above it, gets no connections for +eject_backoff+ seconds
+  #   (doubling per repeat, up to +eject_backoff_max+); then a background
+  #   thread probes it and re-admits it. The last usable member is never
+  #   ejected.
+  # - +read_your_writes+ — seconds after a write during which checkouts with
+  #   the same +affinity:+ key go to the member that took it (the coordinator
+  #   that acknowledged a write reads it back even at ONE). 0 (default) = off.
+  # - +logger+ — a Logger (or anything with +warn+) told of ejections and
+  #   re-admissions.
+  #
+  #   pool = Skaidb::Pool.new(seeds: ["h1:7000", "h2:7000"], database: "app", maxsize: 8,
+  #                           load_balancing: :least_latency, discover: true)
   #   pool.with { |conn| conn.exec("SELECT 1") }
   #   pool.close
   class Pool
-    def initialize(maxsize: 10, **connect_kwargs)
-      raise ArgumentError, "maxsize must be >= 1" if maxsize < 1
+    POLICIES = %i[random round_robin least_latency].freeze
+    IDLE_ORDERS = %i[lifo fifo].freeze
+    # Latency EWMA: each round trip moves a member's average 5% toward it,
+    # and no sample counts for more than 10x the larger of the current
+    # average and the ejection floor — one slow query does not eject a
+    # healthy member, a member that stays slow is ejected within a few dozen
+    # statements.
+    EWMA_WEIGHT = 0.05
+    EWMA_CLAMP = 10.0
+    # Round trips a member (and at least one other) needs before its average
+    # can eject it.
+    EWMA_MIN_SAMPLES = 10
+    # least_latency: a member whose last round trip is older than this scores
+    # 0, so a lightly loaded pool keeps re-measuring every member instead of
+    # settling forever on whichever answered fastest once.
+    STALE_SAMPLE = 2.0
+    # Discovery refresh while a listed member is not ready: a member is often
+    # +unreachable+ or +resyncing+ only for seconds (a peer's circuit breaker
+    # right after it restarts), and waiting a whole refresh interval to let
+    # it back in leaves the load on the others.
+    REFRESH_NOT_READY = 5.0
+    # How often the background thread checks for members due a re-probe.
+    MAINTAIN_TICK = 0.25
+    # Read-your-writes keys kept before the expired ones are swept.
+    AFFINITY_SWEEP = 4096
+    private_constant :EWMA_WEIGHT, :EWMA_CLAMP, :EWMA_MIN_SAMPLES, :STALE_SAMPLE,
+                     :REFRESH_NOT_READY, :MAINTAIN_TICK, :AFFINITY_SWEEP
 
+    # One member as the pool sees it.
+    class Member
+      attr_reader :endpoint, :host, :port, :seed
+      attr_accessor :canonical, :listed, :ewma, :samples, :last_sample, :errors,
+                    :ejected_until, :ejections, :readmitted_at, :in_use, :probing
+
+      def initialize(host, port, seed)
+        @host = host
+        @port = port
+        @endpoint = "#{host}:#{port}" # what the pool dials, and its key
+        @seed = seed                  # configured: discovery never drops it
+        @canonical = nil              # its own SHOW ENDPOINTS name
+        @listed = :ready              # :ready, :resyncing, :unreachable, :unlisted
+        @ewma = nil                   # seconds
+        @samples = 0
+        @last_sample = 0.0
+        @errors = 0                   # consecutive transport failures
+        @ejected_until = nil          # nil = admitted
+        @ejections = 0
+        @readmitted_at = 0.0
+        @in_use = 0
+        @probing = false
+      end
+    end
+    private_constant :Member
+
+    def initialize(maxsize: 10, load_balancing: :random, idle_order: :lifo, discover: false,
+                   refresh_interval: 60.0, read_your_writes: 0.0, eject_errors: 3,
+                   eject_latency_factor: 3.0, eject_latency_floor: 0.05, eject_backoff: 5.0,
+                   eject_backoff_max: 60.0, logger: nil, **connect_kwargs)
+      raise ArgumentError, "maxsize must be >= 1" if maxsize < 1
+      raise ArgumentError, "eject_errors must be >= 1" if eject_errors < 1
+
+      @policy = choice(load_balancing, POLICIES, "load_balancing")
+      @fifo = choice(idle_order, IDLE_ORDERS, "idle_order") == :fifo
       @maxsize = maxsize
-      @kwargs = connect_kwargs
+      @discover = discover ? true : false
+      @refresh_interval = refresh_interval.to_f
+      @ryw = read_your_writes.to_f
+      @eject_errors = eject_errors
+      @eject_factor = eject_latency_factor.to_f
+      @eject_floor = eject_latency_floor.to_f
+      @backoff = eject_backoff.to_f
+      @backoff_max = eject_backoff_max.to_f
+      @logger = logger
+      @conn_opts = Skaidb.connection_options(**connect_kwargs)
+      @port = @conn_opts[:port]
+      seeds = @conn_opts[:seeds]
+      @members = {}
+      (seeds && !seeds.empty? ? seeds : ["#{@conn_opts[:host]}:#{@port}"]).each do |s|
+        host, port = Skaidb.parse_endpoint(s, @port)
+        @members["#{host}:#{port}"] ||= Member.new(host, port, true)
+      end
       @idle = []
       @mutex = Mutex.new
+      @wake = ConditionVariable.new
+      @rr = -1
+      @affinity = {}
+      @discovery_off = false
+      @next_refresh = 0.0
+      @maintainer = nil
       @closed = false
     end
 
-    # Check out a usable connection, reusing an idle one when possible.
-    def checkout
+    # -- checkout / checkin --
+
+    # Check out a usable connection: an idle one to the member the policy
+    # picks, or a new one dialed to it (falling back to the other members).
+    # +affinity+ scopes read-your-writes (nil = pool-wide).
+    def checkout(affinity: nil)
       loop do
-        conn = @mutex.synchronize do
+        conn = order = nil
+        stale = []
+        @mutex.synchronize do
           raise Error, "pool is closed" if @closed
 
-          @idle.pop
+          target = pick(affinity)
+          conn, stale = take_idle(target)
+          order = order_for(target) if conn.nil?
         end
-        return Skaidb.connect(**@kwargs) if conn.nil?
-        # A connection the server closed while it sat idle still looks fine
-        # locally, so check before handing it out.
-        return conn if conn.usable?
-
-        begin
-          conn.close
-        rescue StandardError
-          nil
+        stale.each { |c| close_quietly(c) }
+        if conn.nil?
+          conn = Connection.new(**@conn_opts, endpoints: order, observer: self)
+          conn.pool_member = conn.endpoint
+          discover_through(conn)
+          unless conn.usable?
+            close_quietly(conn)
+            next
+          end
+        elsif !conn.usable?
+          # A connection the server closed while it sat idle still looks
+          # fine locally, so check before handing it out.
+          close_quietly(conn)
+          next
         end
+        @mutex.synchronize do
+          m = @members[conn.pool_member]
+          m.in_use += 1 if m
+          conn.pool_affinity = affinity
+          conn.pool_out = true
+        end
+        return conn
       end
     end
 
-    # Return a connection, closing it if broken or the pool is full.
+    # Return a connection, closing it if it is broken, its member is ejected
+    # or gone, or the pool is full.
     def checkin(conn)
       keep = @mutex.synchronize do
-        !@closed && conn.usable? && @idle.length < @maxsize
+        if conn.pool_out
+          conn.pool_out = false
+          counted = @members[conn.pool_member]
+          counted.in_use -= 1 if counted && counted.in_use.positive?
+        end
+        m = @members[conn.pool_member]
+        if !@closed && conn.usable? && m && usable?(m) && @idle.length < @maxsize
+          @idle.push(conn)
+          true
+        else
+          false
+        end
       end
-      if keep
-        @mutex.synchronize { @idle.push(conn) }
-        return
-      end
-      begin
-        conn.close
-      rescue StandardError
-        nil
-      end
+      close_quietly(conn) unless keep
     end
 
     # Run the block with a checked-out connection, returning it afterwards.
-    def with
-      conn = checkout
+    # +affinity+ scopes read-your-writes (nil = pool-wide).
+    def with(affinity: nil)
+      conn = checkout(affinity: affinity)
       begin
         yield conn
       ensure
@@ -1431,20 +1662,400 @@ module Skaidb
       end
     end
 
-    # Close the pool and every idle connection.
+    # The members as the pool sees them, for monitoring: one Hash each with
+    # +:endpoint+ (what the pool dials), +:canonical+ (the member's own name,
+    # once discovered), +:state+ (+:ready+, +:ejected+, +:resyncing+,
+    # +:unreachable+, +:unlisted+), +:latency_ms+ (the round-trip average,
+    # nil until measured), +:in_use+, +:idle+ and +:seed+.
+    def members
+      @mutex.synchronize do
+        idle = Hash.new(0)
+        @idle.each { |c| idle[c.pool_member] += 1 }
+        @members.values.sort_by { |m| [m.host, m.port] }.map do |m|
+          { endpoint: m.endpoint, canonical: m.canonical,
+            state: m.ejected_until ? :ejected : m.listed,
+            latency_ms: m.ewma && m.ewma * 1000.0, in_use: m.in_use,
+            idle: idle[m.endpoint], seed: m.seed }
+        end
+      end
+    end
+
+    # Close the pool and every idle connection, and stop the background
+    # thread. Checked-out connections are closed when they are returned.
     def close
       drained = @mutex.synchronize do
         @closed = true
+        @wake.broadcast
         d = @idle
         @idle = []
         d
       end
-      drained.each do |c|
-        begin
-          c.close
-        rescue StandardError
-          nil
+      drained.each { |c| close_quietly(c) }
+    end
+
+    # -- what connections report (internal: called by Connection, any thread) --
+
+    # Internal: the order a pooled connection re-dials in — the usable
+    # members first, +exclude+ (the member it lost) last.
+    def dial_order(exclude)
+      @mutex.synchronize { order_for(nil, exclude) }
+    end
+
+    # Internal: a round trip on +conn+ took +elapsed+ seconds.
+    def note_round_trip(conn, elapsed)
+      @mutex.synchronize do
+        ep = conn.endpoint
+        if ep != conn.pool_member
+          # The connection re-dialed to another member mid-checkout.
+          if conn.pool_out
+            old = @members[conn.pool_member]
+            old.in_use -= 1 if old && old.in_use.positive?
+            moved = @members[ep]
+            moved.in_use += 1 if moved
+          end
+          conn.pool_member = ep
         end
+        m = @members[ep]
+        next if m.nil?
+
+        m.errors = 0
+        if m.ewma.nil?
+          m.ewma = elapsed
+        else
+          cap = EWMA_CLAMP * [m.ewma, @eject_floor].max
+          m.ewma += EWMA_WEIGHT * ([elapsed, cap].min - m.ewma)
+        end
+        m.samples += 1
+        m.last_sample = now
+        next unless m.samples >= EWMA_MIN_SAMPLES && @eject_factor.positive? && m.ejected_until.nil?
+
+        others = @members.each_value.select do |o|
+          !o.equal?(m) && usable?(o) && o.ewma && o.samples >= EWMA_MIN_SAMPLES
+        end.map(&:ewma).sort
+        next if others.empty?
+
+        median = others[(others.length - 1) / 2]
+        if m.ewma > @eject_factor * median && m.ewma - median > @eject_floor
+          eject(m, format("latency %.1f ms vs median %.1f ms", m.ewma * 1000, median * 1000))
+        end
+      end
+    end
+
+    # Internal: a dial or a request to +endpoint+ failed in transport.
+    def note_failure(endpoint)
+      @mutex.synchronize do
+        m = @members[endpoint]
+        next if m.nil?
+
+        m.errors += 1
+        eject(m, "#{m.errors} consecutive connection failures") if m.errors >= @eject_errors && m.ejected_until.nil?
+      end
+    end
+
+    # Internal: +sql+ succeeded on +conn+; a write pins the connection's
+    # affinity key to its member for +read_your_writes+ seconds.
+    def note_statement(conn, sql)
+      return if @ryw <= 0 || !conn.pool_out || !Skaidb.write_statement?(sql)
+
+      t = now
+      @mutex.synchronize do
+        @affinity.select! { |_, (_, untl)| untl > t } if @affinity.length >= AFFINITY_SWEEP
+        @affinity[conn.pool_affinity] = [conn.endpoint, t + @ryw]
+      end
+    end
+
+    # Internal: +conn+ was closed while checked out instead of returned.
+    def note_closed(conn)
+      @mutex.synchronize do
+        next unless conn.pool_out
+
+        conn.pool_out = false
+        m = @members[conn.pool_member]
+        m.in_use -= 1 if m && m.in_use.positive?
+      end
+    end
+
+    private
+
+    def choice(value, allowed, name)
+      v = value.to_s.downcase.to_sym if value.is_a?(String) || value.is_a?(Symbol)
+      return v if allowed.include?(v)
+
+      names = allowed.map(&:inspect)
+      raise ArgumentError, "unknown #{name} #{value.inspect} (use #{names[0..-2].join(', ')} or #{names[-1]})"
+    end
+
+    def now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    def close_quietly(conn)
+      conn.close
+    rescue StandardError
+      nil
+    end
+
+    def log(message)
+      @logger&.warn("skaidb pool: #{message}")
+    end
+
+    # -- choosing a member (callers hold @mutex) --
+
+    def usable?(m)
+      m.ejected_until.nil? && m.listed == :ready
+    end
+
+    # The member this checkout should go to, or nil for "any" (the random
+    # policy, or no usable member at all).
+    def pick(affinity)
+      if @ryw.positive? && (hit = @affinity[affinity])
+        ep, untl = hit
+        m = @members[ep]
+        if now >= untl || m.nil?
+          @affinity.delete(affinity)
+        elsif usable?(m)
+          return m
+        end
+      end
+      usable = @members.values.select { |m| usable?(m) }
+      return nil if usable.empty? || @policy == :random
+
+      if @policy == :round_robin
+        usable.sort_by! { |m| [m.host, m.port] }
+        @rr = (@rr + 1) % usable.length
+        return usable[@rr]
+      end
+      return usable[0] if usable.length == 1
+
+      a, b = usable.sample(2)
+      score(a) <= score(b) ? a : b
+    end
+
+    # A member never measured, or not lately, scores 0: it is tried and
+    # measured.
+    def score(m)
+      return 0.0 if m.ewma.nil? || now - m.last_sample > STALE_SAMPLE
+
+      m.ewma * (m.in_use + 1)
+    end
+
+    # Remove and return an idle connection (to +target+, or to any usable
+    # member), plus the idle connections found to belong to members that are
+    # no longer usable (to close outside the lock).
+    def take_idle(target)
+      stale = []
+      found = nil
+      indexes = @fifo ? (0...@idle.length) : (@idle.length - 1).downto(0)
+      indexes.each do |i|
+        m = @members[@idle[i].pool_member]
+        if m.nil? || !usable?(m)
+          stale << i
+        elsif target.nil? || m.equal?(target)
+          found = i
+          break
+        end
+      end
+      picked = found && @idle[found]
+      stale_conns = stale.map { |i| @idle[i] }
+      (found ? stale + [found] : stale).sort.reverse_each { |i| @idle.delete_at(i) }
+      [picked, stale_conns]
+    end
+
+    # [host, port] pairs to dial, best first: +first+, the other usable
+    # members in random order, then the rest (resyncing/unreachable before
+    # ejected, soonest re-admission first) — a dial never has nowhere to go
+    # while any member is configured. +exclude+ goes last.
+    def order_for(first, exclude = nil)
+      all = @members.values
+      usable = all.select { |m| !m.equal?(first) && usable?(m) }.shuffle
+      rest = all.select { |m| !m.equal?(first) && !usable?(m) }
+      rest = rest.sort_by { |m| m.ejected_until ? [1, m.ejected_until] : [0, 0.0] }
+      order = (first ? [first] : []) + usable + rest
+      lost = exclude && order.length > 1 && order.find { |m| m.endpoint == exclude }
+      order = order.reject { |m| m.equal?(lost) } + [lost] if lost
+      order.map { |m| [m.host, m.port] }
+    end
+
+    # -- ejection and re-admission --
+
+    # Take +m+ out of rotation (caller holds @mutex) — unless it is the last
+    # usable member: a slow or flaky member beats none.
+    def eject(m, why)
+      return unless @members.each_value.any? { |o| !o.equal?(m) && usable?(o) }
+
+      t = now
+      m.ejections = 0 if t - m.readmitted_at > @backoff_max # healthy for a while: start over
+      m.ejections += 1
+      m.ejected_until = t + backoff_for(m)
+      log("ejecting #{m.endpoint} (#{why})")
+      ensure_maintainer
+    end
+
+    def backoff_for(m)
+      [@backoff * (2**[m.ejections - 1, 0].max), @backoff_max].min
+    end
+
+    # Start the background thread (caller holds @mutex): it re-probes ejected
+    # members and refreshes discovery, and ends when the pool closes. Ruby
+    # never waits for it at exit.
+    def ensure_maintainer
+      return if @maintainer || @closed
+
+      @maintainer = Thread.new { maintain }
+      @maintainer.name = "skaidb-pool"
+    end
+
+    def maintain
+      loop do
+        due = []
+        refresh = false
+        @mutex.synchronize do
+          @wake.wait(@mutex, MAINTAIN_TICK) unless @closed
+          return if @closed
+
+          t = now
+          due = @members.each_value.select { |m| m.ejected_until && t >= m.ejected_until && !m.probing }
+          due.each { |m| m.probing = true }
+          refresh = @discover && !@discovery_off && t >= @next_refresh
+        end
+        due.each { |m| probe(m) }
+        refresh_members if refresh
+      end
+    end
+
+    # Dial +m+ alone and run one statement: success re-admits it (the probe
+    # connection joins the idle set), failure ejects it again for twice as
+    # long.
+    def probe(m)
+      conn = nil
+      ok = begin
+        conn = Connection.new(**@conn_opts, endpoints: [[m.host, m.port]])
+        conn.exec("SHOW DATABASES")
+        true
+      rescue StandardError
+        false
+      end
+      keep = false
+      @mutex.synchronize do
+        m.probing = false
+        if ok && !@closed
+          m.ejected_until = nil
+          m.errors = 0
+          m.ewma = nil
+          m.samples = 0
+          m.readmitted_at = now
+          log("re-admitted #{m.endpoint}")
+          if @idle.length < @maxsize
+            conn.observer = self
+            conn.pool_member = m.endpoint
+            @idle.push(conn)
+            keep = true
+          end
+        else
+          m.ejections += 1
+          m.ejected_until = now + backoff_for(m)
+        end
+      end
+      close_quietly(conn) if conn && !keep
+    end
+
+    # -- discovery --
+
+    # Run discovery on a freshly dialed connection when the member it reached
+    # has not named itself yet (once per member, so seeds given as host names
+    # are matched to the endpoints the server reports).
+    def discover_through(conn)
+      return if !@discover || @discovery_off
+
+      ask = @mutex.synchronize do
+        m = @members[conn.pool_member]
+        next false if m.nil? || m.canonical
+
+        ensure_maintainer
+        true
+      end
+      list_through(conn) if ask
+    end
+
+    def refresh_members
+      conn = begin
+        checkout
+      rescue StandardError
+        @mutex.synchronize { @next_refresh = now + @refresh_interval }
+        return
+      end
+      begin
+        list_through(conn)
+      ensure
+        checkin(conn)
+      end
+    end
+
+    def list_through(conn)
+      rows = begin
+        conn.exec("SHOW ENDPOINTS").rows
+      rescue QueryError
+        # A server that predates the statement: keep the seeds.
+        @mutex.synchronize { @discovery_off = true }
+        return
+      rescue Error
+        return
+      end
+      if rows.empty?
+        # A standalone server: nothing to discover, ever.
+        @mutex.synchronize { @discovery_off = true }
+        return
+      end
+      @mutex.synchronize do
+        apply_listing(conn.pool_member, rows)
+        interval = @refresh_interval
+        if @members.each_value.any? { |m| m.listed == :resyncing || m.listed == :unreachable }
+          interval = [interval, REFRESH_NOT_READY].min
+        end
+        @next_refresh = now + interval
+      end
+    end
+
+    # Fold a non-empty SHOW ENDPOINTS answer (caller holds @mutex).
+    def apply_listing(dialed, rows)
+      listed = {}
+      rows.each do |endpoint, state, local|
+        listed[endpoint] = state
+        next unless local
+
+        me = @members[dialed]
+        me.canonical = endpoint if me
+      end
+      # A member reported under the name of one already known (a seed given
+      # as a host name) is that member, not a new one.
+      by_name = {}
+      @members.each_value do |m|
+        by_name[m.canonical] = m if m.canonical && (!by_name.key?(m.canonical) || m.seed)
+      end
+      @members.delete_if { |_, m| m.canonical && !by_name[m.canonical].equal?(m) } # a duplicate of a seed
+      seen = {}.compare_by_identity
+      listed.each do |endpoint, state|
+        m = by_name[endpoint]
+        if m.nil?
+          host, port = Skaidb.parse_endpoint(endpoint, @port)
+          m = (@members["#{host}:#{port}"] ||= Member.new(host, port, false))
+          m.canonical = endpoint
+        end
+        state = %w[ready resyncing unreachable].include?(state) ? state.to_sym : :ready
+        if state == :ready && m.listed != :ready
+          # Back in rotation: measured afresh, like a re-admission.
+          m.ewma = nil
+          m.samples = 0
+          m.errors = 0
+        end
+        m.listed = state
+        seen[m] = true
+      end
+      @members.delete_if do |_, m|
+        next false if seen[m] || (m.seed && m.canonical.nil?) # listed, or a seed not identified yet
+
+        m.listed = :unlisted if m.seed # configured, but no longer a member
+        !m.seed
       end
     end
   end

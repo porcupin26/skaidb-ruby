@@ -128,12 +128,14 @@ module FakeSkaidb
     ITERATIONS = 1000
 
     attr_reader :port, :requests, :hellos, :connections
-    attr_accessor :corrupt_server_signature, :handler
+    attr_accessor :corrupt_server_signature, :handler, :refuse
 
     # password: the one password every user has.
     # handler: ->(req, conn) { payload | [payloads] | :close | nil } for every
     #   post-handshake request; Hello is answered with Ddl unless the handler
     #   returns something; nil for anything else answers Error.
+    # refuse (attribute): while true, each new connection is closed before
+    #   the handshake — a node that is down while its port still accepts.
     def initialize(password: "secret", &handler)
       @password = password
       @handler = handler || ->(_req, _conn) { nil }
@@ -144,6 +146,7 @@ module FakeSkaidb
       @threads = []
       @mutex = Mutex.new
       @corrupt_server_signature = false
+      @refuse = false
     end
 
     def start
@@ -155,6 +158,10 @@ module FakeSkaidb
             @server.accept
           rescue StandardError
             break
+          end
+          if @refuse
+            sock.close rescue nil
+            next
           end
           @mutex.synchronize do
             @connections += 1

@@ -73,6 +73,8 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
 - `usable?` — `false` once closed, once a transport error broke the socket,
   or while a stream is in flight (including one abandoned through external
   iteration). No round-trip.
+- `endpoint` — the member the connection reached, as the `"host:port"` it
+  dialed (it changes when a re-dial lands on another member).
 - `closed`, `finished?` — `true` after `close`.
 - `close` — closes the socket; idempotent. Does not take the connection's
   lock, so another thread can use it to break a blocked read.
@@ -81,10 +83,11 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
 
 A transport failure raises `Skaidb::ConnectionError` and marks the
 connection broken. The next `exec`/`exec_params`/`exec_batch`/`stream`
-re-dials across the original seeds, re-authenticates, re-sends `Hello`,
-re-runs `USE`, and starts with an empty prepared-statement cache. If the
-re-dial fails, that statement raises `ConnectionError` and the one after it
-tries again.
+re-dials across the original seeds (a pooled connection: in the pool's
+order, usable members first and the one it lost last), re-authenticates,
+re-sends `Hello`, re-runs `USE`, and starts with an empty prepared-statement
+cache. If the re-dial fails, that statement raises `ConnectionError` and the
+one after it tries again.
 
 ## `Skaidb::Result`
 
@@ -105,10 +108,33 @@ Shaped like `PG::Result`; `Enumerable` over row Hashes.
 
 ## `Skaidb::Pool`
 
-`Skaidb::Pool.new(maxsize: 10, **connect_options)` — see
-[pooling.md](pooling.md). `with { |conn| }`, `checkout`, `checkin(conn)`,
-`close`. Raises `ArgumentError` for `maxsize < 1` and `Skaidb::Error` on
-checkout from a closed pool.
+```ruby
+Skaidb::Pool.new(maxsize: 10, load_balancing: :random, idle_order: :lifo, discover: false,
+                 refresh_interval: 60.0, read_your_writes: 0.0, eject_errors: 3,
+                 eject_latency_factor: 3.0, eject_latency_floor: 0.05, eject_backoff: 5.0,
+                 eject_backoff_max: 60.0, logger: nil, **connect_options)
+```
+
+A thread-safe pool balanced across the cluster's members — see
+[pooling.md](pooling.md) for every option.
+
+- `with(affinity: nil) { |conn| … }` — check out, yield, check in; returns
+  the block's value.
+- `checkout(affinity: nil) → Connection` — an idle connection to the member
+  the policy picks, or a new one. Never blocks. `affinity` (any Hash key;
+  `nil` = pool-wide) scopes `read_your_writes`.
+- `checkin(conn)` — return it; closed instead when broken, when its member
+  is ejected or gone, or when `maxsize` are already idle.
+- `members → Array<Hash>` — per member: `:endpoint`, `:canonical`, `:state`
+  (`:ready`, `:ejected`, `:resyncing`, `:unreachable`, `:unlisted`),
+  `:latency_ms` (`nil` until measured), `:in_use`, `:idle`, `:seed`.
+- `close` — closes the idle connections and stops the background thread.
+
+`load_balancing` (`:random`, `:round_robin`, `:least_latency`) and
+`idle_order` (`:lifo`, `:fifo`) take a Symbol or a String. Raises
+`ArgumentError` for `maxsize < 1`, `eject_errors < 1` or an unknown
+`load_balancing`/`idle_order`, and `Skaidb::Error` on checkout from a closed
+pool.
 
 ## `Skaidb::Uuid`
 
