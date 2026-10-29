@@ -55,7 +55,8 @@ class FramingTest < Minitest::Test
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted(
         { "SELECT 1" => FakeSkaidb::F.rows(["c"], [[1]]),
-          "SELECT s" => [FakeSkaidb::F.header(["c"]), FakeSkaidb::F.rows_end] },
+          "SELECT s" => [FakeSkaidb::F.header(["c"]), FakeSkaidb::F.rows_end],
+          "SELECT s WHERE c = ?" => [FakeSkaidb::F.header(["c"]), FakeSkaidb::F.rows_end] },
         prepared: { "INSERT INTO t VALUES (?, ?)" => 2 },
         on_execute: ->(_sql, _req) { FakeSkaidb::F.mutation(1) },
         on_batch: ->(_sql, req) { FakeSkaidb::F.mutation(req.rows.length) }
@@ -65,10 +66,11 @@ class FramingTest < Minitest::Test
       c.exec_params("INSERT INTO t VALUES ($1, $2)", [1, "a"], consistency: :one)
       c.exec_batch("INSERT INTO t VALUES ($1, $2)", [[2, "b"], [3, "c"]])
       c.stream("SELECT s") { |_| nil }
+      c.stream("SELECT s WHERE c = $1", ["x"], consistency: :one) { |_| nil }
       c.close
       reqs = srv.requests
     end
-    assert_equal [8, 1, 2, 3, 7, 5], reqs.map(&:op)
+    assert_equal [8, 1, 2, 3, 7, 5, 9], reqs.map(&:op)
     assert_equal [2, "SELECT 1"], [reqs[1].consistency, reqs[1].sql]
     assert_equal "INSERT INTO t VALUES (?, ?)", reqs[2].sql
     assert_equal [0, 100, [1, "a"]], [reqs[3].consistency, reqs[3].id, reqs[3].params]
@@ -81,5 +83,17 @@ class FramingTest < Minitest::Test
     assert_equal Skaidb.encode_value(1), ex.byteslice(12, 9)
     # OP_EXECUTE_BATCH: u8 op, u8 consistency, u32 id, u32 nrows, rows of (u16 n + values)
     assert_equal [7, 2, 100, 2, 2], reqs[4].raw.unpack("CCVVv")
+    # OP_QUERY_STREAM: u8 op, u8 consistency, u32 sql_len + sql — nothing after it
+    assert_equal [5, 2].pack("CC") + Skaidb.enc_str("SELECT s"), reqs[5].raw
+    # OP_QUERY_STREAM_PARAMS: u8 op, u8 consistency, u32 sql_len + sql (? placeholders),
+    # u16 nparams, then (u32 len + value)* — OP_EXECUTE's parameter vector
+    sp = reqs[6].raw
+    sql = "SELECT s WHERE c = ?"
+    assert_equal [0, sql, ["x"]], [reqs[6].consistency, reqs[6].sql, reqs[6].params]
+    assert_equal [9, 0, sql.bytesize], sp.unpack("CCV")
+    assert_equal sql, sp.byteslice(6, sql.bytesize)
+    assert_equal 1, sp.byteslice(6 + sql.bytesize, 2).unpack1("v")
+    x = Skaidb.encode_value("x")
+    assert_equal [x.bytesize].pack("V") + x, sp.byteslice((8 + sql.bytesize)..)
   end
 end

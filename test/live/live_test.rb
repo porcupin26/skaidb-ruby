@@ -113,6 +113,20 @@ class LiveTest < Minitest::Test
     first = conn.stream("SELECT id FROM #{TABLE}_big ORDER BY id").first(3)
     assert_equal [1, 2, 3], first.map { |r3| r3["id"] }
     assert conn.usable?
+    # a stream with bound parameters (server >= 0.330), typed as exec_params binds them
+    begin
+      bound = []
+      conn.stream("SELECT id, pad FROM #{TABLE}_big WHERE id > $1 AND id <= $2 AND pad = $3 ORDER BY id",
+                  [2490, 2495, "pad-2493" * 4]) { |r4| bound << r4["id"] }
+      assert_equal [2493], bound
+      first_two = conn.stream("SELECT id FROM #{TABLE}_big WHERE id > $1 ORDER BY id", [2490]).first(2)
+      assert_equal [2491, 2492], first_two.map { |r5| r5["id"] }
+    rescue Skaidb::QueryError => e
+      raise unless e.message.include?("does not support parameterised streaming")
+
+      warn "server predates parameterised streaming, skipped: #{e.message}"
+    end
+    assert conn.usable?
     assert_equal 2500, conn.exec("SELECT count(*) AS c FROM #{TABLE}_big")[0]["c"]
 
     # an error surfaces as QueryError and keeps the connection usable

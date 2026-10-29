@@ -30,5 +30,13 @@ Skaidb.connect(host: host, port: port, user: user, password: pw, database: db) d
   puts "first three: #{first.map { |r| r['id'] }.inspect}"
   puts "connection still usable: #{conn.usable?}"
 
+  # Bound parameters (server >= 0.330): $1, $2, ... exactly as exec_params
+  # takes them, sent typed instead of written into the SQL.
+  last = []
+  conn.stream("SELECT id FROM big WHERE id > $1 AND id <= $2 ORDER BY id", [19_995, 20_000]) do |row|
+    last << row["id"]
+  end
+  puts "last five: #{last.inspect}"
+
   conn.exec("DROP TABLE big")
 end

@@ -55,8 +55,16 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
 - `prepare_server(sql) → [id, nparams] | nil` — prepare a statement with `?`
   placeholders on the server; `nil` when the server refuses. Cached per
   connection (240 entries); the cache is cleared on re-dial.
-- `stream(sql, consistency: nil) { |row| … } → Result` — see
-  [streaming.md](streaming.md). For a row stream the returned Result has
+- `stream(sql, params = [], consistency: nil) { |row| … } → Result` — see
+  [streaming.md](streaming.md). `params` (an Array) bind `$1`, `$2`, …
+  exactly as `exec_params` binds them, typed, over `OP_QUERY_STREAM_PARAMS`
+  (server ≥ 0.330; an older one raises `QueryError` `server does not support
+  parameterised streaming (skaidb >= 0.330): …`, with no text fallback);
+  without parameters (`nil` or `[]`) the request is the original
+  `OP_QUERY_STREAM`, which every server understands. A placeholder/parameter
+  mismatch or a value that cannot be bound raises `QueryError` before
+  anything is sent, and `params` that are not an Array raise
+  `ArgumentError`. For a row stream the returned Result has
   `kind == :stream`, the column names in `fields` and no `rows` (they went to
   the block); a statement without rows returns its `:mutation` / `:ddl`
   Result without yielding. Without a block returns an Enumerator.

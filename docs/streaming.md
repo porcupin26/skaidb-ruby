@@ -4,7 +4,12 @@
 a result that should not be held in memory at once, `stream` runs the
 statement over the protocol's streaming opcode: the server answers with a
 header (the column names), then row chunks, then an end marker, and the
-driver yields rows as each chunk arrives, holding one chunk at a time.
+driver yields rows as each chunk arrives, holding one chunk at a time. The
+server executes a plain `SELECT` (bare columns from one table, unordered or
+in storage-key order) page by page, and no scan budget applies to a
+streamed page (server ≥ 0.330; `EXPLAIN` says whether a statement pages, and
+the rules are under "Streamed queries" in the server's
+[SQL syntax reference](https://skaidb.org/docs/query_syntax.html)).
 
 ```ruby
 conn.stream("SELECT id, payload FROM events ORDER BY id") do |row|
@@ -12,7 +17,9 @@ conn.stream("SELECT id, payload FROM events ORDER BY id") do |row|
 end
 ```
 
-- `stream(sql, consistency: nil)` takes SQL text only — no parameters.
+- `stream(sql, params = [], consistency: nil)`: `params` bind `$1`, `$2`, …
+  exactly as `exec_params` binds them ([Parameters](#parameters), below);
+  `consistency:` overrides the connection's level for this statement.
 - With a block it returns a `Skaidb::Result` after the last row: `kind` is
   `:stream`, `fields` holds the column names (known even when no row
   arrived), and `rows` is empty because the rows went to the block.
@@ -23,6 +30,34 @@ end
   `:mutation` with `cmd_tuples`, or `:ddl`) without yielding.
 - A server without the streaming opcode raises `Skaidb::QueryError`
   (`server does not support streaming: …`).
+
+## Parameters
+
+`params` bind the statement's `$1`, `$2`, … placeholders exactly as
+`exec_params` binds them: typed, with every value [types.md](types.md) lists
+(Arrays, Hashes, `Time`, `BigDecimal`, `Skaidb::Uuid`, …), the same `$N` as
+often as you like, and the same checks before anything is sent (a
+placeholder without a parameter, a parameter no placeholder uses, a bare
+`?`).
+
+```ruby
+conn.stream("SELECT id, ts, body FROM events WHERE ts >= $1 AND ts < $2", [from, to]) do |row|
+  export(row)
+end
+
+conn.stream("SELECT id, v FROM t WHERE tenant = $1", [tenant], consistency: :one).each_slice(1000) do |batch|
+  load(batch)
+end
+```
+
+They travel in `OP_QUERY_STREAM_PARAMS`, which needs a server ≥ 0.330. An
+older server refuses it, and `stream` raises `Skaidb::QueryError`
+(`server does not support parameterised streaming (skaidb >= 0.330): …`);
+the connection stays usable. Unlike `exec_params` there is no client-side
+text fallback. A stream without parameters (`nil` or `[]`) sends the
+original `OP_QUERY_STREAM` with the SQL untouched, so it works against every
+server. `params` must be an Array — anything else raises `ArgumentError`;
+the consistency is only ever the `consistency:` keyword.
 
 ## Errors mid-stream
 

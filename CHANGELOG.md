@@ -4,6 +4,24 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-29
+
+### Added
+- **Parameterised streaming**: `conn.stream(sql, params)` binds `$1`, `$2`,
+  … exactly as `exec_params(sql, params)` does — typed, with the same values
+  (Arrays, Hashes, `Time`, `BigDecimal`, `Skaidb::Uuid`, …) and the same
+  placeholder checks — over `OP_QUERY_STREAM_PARAMS` (server ≥ 0.330), so a
+  range-bounded export no longer needs its values written into the SQL. It
+  takes `consistency:`, a block or the Enumerator form like any stream.
+  Without parameters (`nil` or `[]`) the request is the original
+  `OP_QUERY_STREAM`, byte for byte, so it works against every server; a
+  parameterised stream against an older server raises `QueryError`
+  (`server does not support parameterised streaming (skaidb >= 0.330): …`)
+  and leaves the connection usable. `params` that are not an Array raise
+  `ArgumentError`.
+- The vendored conformance suite's `stream_params` case (a streamed
+  statement with bound parameters) runs through `stream(sql, params)`.
+
 ## [1.2.0] - 2026-10-25
 
 ### Added
@@ -174,6 +192,7 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.3.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/porcupin26/skaidb-ruby/compare/v1.0.2...v1.0.3

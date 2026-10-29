@@ -118,6 +118,12 @@ module FakeSkaidb
       Request.new(op: op, consistency: consistency, id: id, rows: rows, raw: payload)
     when 8
       Request.new(op: op, name: r.text, version: r.text, raw: payload)
+    when 9
+      consistency = r.u8
+      sql = r.text
+      n = r.u16
+      params = Array.new(n) { Skaidb.decode_value(Skaidb::Reader.new(r.blob)) }
+      Request.new(op: op, consistency: consistency, sql: sql, params: params, raw: payload)
     else
       Request.new(op: op, raw: payload)
     end
@@ -268,8 +274,9 @@ module FakeSkaidb
     end
   end
 
-  # A scripted handler: `script[sql]` answers OP_QUERY / OP_QUERY_STREAM text
-  # (a payload, an Array of payloads, or a Proc taking the request),
+  # A scripted handler: `script[sql]` answers OP_QUERY / OP_QUERY_STREAM /
+  # OP_QUERY_STREAM_PARAMS text (a payload, an Array of payloads, or a Proc
+  # taking the request; the parameterised form is keyed by its `?` SQL),
   # `prepared[sql]` makes OP_PREPARE succeed with that arity, executes are
   # answered by `on_execute.(sql, req)` and batches by `on_batch.(sql, req)`.
   def self.scripted(script = nil, prepared: {}, on_execute: nil, on_batch: nil, **inline)
@@ -278,7 +285,7 @@ module FakeSkaidb
     next_id = 100
     lambda do |req, conn|
       case req.op
-      when 1, 5
+      when 1, 5, 9
         a = script[req.sql]
         return F.error("fake server: unknown statement #{req.sql}") if a.nil?
 

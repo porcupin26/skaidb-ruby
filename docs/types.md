@@ -1,8 +1,9 @@
 # Types
 
 Results decode from skaidb's typed wire values; parameters encode back to
-them when a statement is prepared, which is the normal path whenever you pass
-values to `exec_params` or `exec_batch`.
+them — when a statement is prepared, which is the normal path whenever you
+pass values to `exec_params` or `exec_batch`, and always for the values you
+pass to `stream`.
 
 | skaidb type | Result value | Accepted as a parameter |
 |---|---|---|

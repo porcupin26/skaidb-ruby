@@ -55,13 +55,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.2.0/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.3.0/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.2.0.gem`.
+installs without registry access: `gem install ./skaidb-1.3.0.gem`.
 
 ## Quick start
 
@@ -280,8 +280,9 @@ A result holds all its rows in memory; for results that do not fit, stream.
 
 ## Streaming large results
 
-`conn.stream(sql, consistency: nil)` runs the statement over the streaming
-opcode and yields one row Hash at a time, holding **one chunk** in memory:
+`conn.stream(sql, params = [], consistency: nil)` runs the statement over the
+streaming opcode and yields one row Hash at a time, holding **one chunk** in
+memory:
 
 ```ruby
 conn.stream("SELECT id, pad FROM big ORDER BY id") do |row|
@@ -289,12 +290,23 @@ conn.stream("SELECT id, pad FROM big ORDER BY id") do |row|
 end
 
 first = conn.stream("SELECT id FROM big ORDER BY id").first(10)   # Enumerator form
+
+conn.stream("SELECT id, ts, body FROM events WHERE ts >= $1 AND ts < $2", [from, to]) do |row|
+  export(row)                    # bound parameters, typed
+end
 ```
 
-`stream` takes SQL text only (no parameters). With a block it returns a
-`Result` whose `kind` is `:stream` and whose `fields` are the column names
-(the rows went to the block); a non-row statement returns its `:mutation` /
-`:ddl` Result without yielding.
+`params` bind `$1`, `$2`, … exactly as `exec_params` binds them — typed, with
+the same values accepted — and need a server ≥ 0.330: an older one raises
+`QueryError` (`server does not support parameterised streaming (skaidb >=
+0.330): …`), and there is no client-side text fallback. A stream without
+parameters sends the original streaming opcode, which every server
+understands. The server pages a plain `SELECT` (bare columns from one table,
+unordered or in storage-key order), and no scan budget applies to a streamed
+page (server ≥ 0.330). With a block `stream` returns a `Result` whose `kind`
+is `:stream` and whose `fields` are the column names (the rows went to the
+block); a non-row statement returns its `:mutation` / `:ddl` Result without
+yielding.
 
 **The abandon/drain rule.** The connection is busy for the whole stream:
 a statement from another thread waits for it. Leaving the block early —
@@ -418,8 +430,8 @@ StandardError
 - A transport failure (`ConnectionError`) marks the connection broken; the
   next statement re-dials, or a pool replaces it.
 - `ArgumentError` for `Pool.new(maxsize: 0)` or an unknown
-  `load_balancing`/`idle_order`, and for `Skaidb::Uuid.new` of a string that
-  is not a UUID.
+  `load_balancing`/`idle_order`, for `Skaidb::Uuid.new` of a string that
+  is not a UUID, and for `stream` parameters that are not an Array.
 
 ## Transactions
 
@@ -446,7 +458,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.2.0
+-- ruby | 1.3.0
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after
@@ -461,7 +473,8 @@ know the opcode answers with an error the driver ignores.
   falls back: prepared statements → client-side text binding, `Hello` →
   ignored, pool discovery (`SHOW ENDPOINTS`, server ≥ 0.327) → the
   configured seeds. `stream` and `exec_batch` need a server with those
-  opcodes and raise `QueryError` otherwise.
+  opcodes, and `stream` with parameters a server ≥ 0.330; they raise
+  `QueryError` otherwise.
 - The wire protocol (framing, SCRAM handshake, value encoding, opcodes) is
   specified at <https://skaidb.org/docs/PROTOCOL.html>. The driver speaks the
   binary protocol on port 7000; the server's REST/JSON gateway (port 7080)

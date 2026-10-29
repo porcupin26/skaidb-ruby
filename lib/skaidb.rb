@@ -25,7 +25,8 @@
 # Placeholders use the pg-style +$1+, +$2+, ... . They are sent as TYPED values
 # through a server-side prepared statement where the server accepts one, and
 # interpolated into the SQL client-side, with correct quoting, where it does not
-# (old servers, and statement kinds that cannot be prepared).
+# (old servers, and statement kinds that cannot be prepared). +stream+ sends
+# its parameters typed in the stream request itself and never interpolates.
 require "socket"
 require "openssl"
 require "securerandom"
@@ -34,7 +35,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.2.0"
+  VERSION = "1.3.0"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -930,6 +931,17 @@ module Skaidb
     # large scans.
     #
     #   conn.stream("SELECT ...") { |row| puts row["id"] }
+    #   conn.stream("SELECT id, ts FROM events WHERE ts >= $1 AND ts < $2", [from, to]) { |row| ... }
+    #
+    # +params+ bind +$1+, +$2+, ... exactly as +exec_params+ binds them —
+    # typed, the same values accepted (Arrays, Hashes, Times, ...), the same
+    # placeholder checks — and travel in OP_QUERY_STREAM_PARAMS, which needs
+    # a server >= 0.330: an older one answers QueryError "server does not
+    # support parameterised streaming (skaidb >= 0.330): ..." and the
+    # connection stays usable. Unlike +exec_params+ there is no client-side
+    # text fallback. Without parameters (+nil+ or +[]+) the request is the
+    # original OP_QUERY_STREAM with the SQL untouched, so a parameterless
+    # stream works against every server.
     #
     # The protocol forbids any other request on the connection until the
     # stream ends, so the whole exchange runs under the connection mutex
@@ -962,16 +974,21 @@ module Skaidb
     # no row arrived) while +rows+ stays empty — the rows went to the block;
     # a statement that produces no rows returns its ordinary +:mutation+ or
     # +:ddl+ Result without yielding.
-    #
-    # Takes no parameters — the streaming opcode carries SQL text.
-    def stream(sql, consistency: nil)
-      return enum_for(:stream, sql, consistency: consistency) unless block_given?
+    def stream(sql, params = [], consistency: nil)
+      return enum_for(:stream, sql, params, consistency: consistency) unless block_given?
       raise ConnectionError, "connection is closed" if @closed
-      ensure_live!
 
       level = consistency.nil? ? @consistency : Consistency.resolve(consistency)
-      sql_bytes = sql.dup.force_encoding("UTF-8").b
-      req = [5, level].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
+      params ||= []
+      unless params.is_a?(Array)
+        raise ArgumentError, "stream params must be an Array, got #{params.class} " \
+                             "(the consistency is a keyword: stream(sql, consistency: :one))"
+      end
+      # Built before anything touches the socket, so a parameter that cannot
+      # be bound is refused without a round trip (or a re-dial).
+      req = stream_request(sql, params, level)
+      ensure_live!
+
       live = false
       summary = nil
       @mutex.synchronize do
@@ -989,7 +1006,11 @@ module Skaidb
         case tag
         when 3
           msg = r.text
-          raise QueryError, msg.include?("unknown opcode") ? "server does not support streaming: #{msg}" : msg
+          if msg.include?("unknown opcode")
+            what = params.empty? ? "streaming" : "parameterised streaming (skaidb >= 0.330)"
+            raise QueryError, "server does not support #{what}: #{msg}"
+          end
+          raise QueryError, msg
         when 1
           return Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation) # not row-producing
         when 2
@@ -1309,6 +1330,30 @@ module Skaidb
       res = parse_response(reader)
       note_statement(sql)
       res
+    end
+
+    # The request +stream+ sends. Without parameters: OP_QUERY_STREAM with
+    # the SQL as given, byte for byte what every server understands. With
+    # them: OP_QUERY_STREAM_PARAMS (server >= 0.330), $N rewritten to the
+    # positional ? and the values typed in ? order — the parameter vector
+    # OP_EXECUTE carries (u16 count, then u32 length + value each).
+    def stream_request(sql, params, level)
+      if params.empty?
+        sql_bytes = sql.dup.force_encoding("UTF-8").b
+        return [5, level].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
+      end
+
+      qsql, order = Skaidb.to_qmark(sql.to_s, params)
+      # The count is a u16 on the wire, and pack would wrap a larger one.
+      raise QueryError, "a statement takes at most 65535 parameters, got #{order.length}" if order.length > 0xFFFF
+
+      sql_bytes = qsql.dup.force_encoding("UTF-8").b
+      req = +([9, level].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes + [order.length].pack("v"))
+      order.each do |p|
+        b = Skaidb.encode_value(p)
+        req << [b.bytesize].pack("V") << b
+      end
+      req
     end
 
     # One request and its response under the connection mutex. In a pool the

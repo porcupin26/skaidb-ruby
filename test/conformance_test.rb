@@ -270,8 +270,12 @@ module Conformance
       outcome do
         rows = []
         columns = nil
+        # With call.params, the parameterised form: the vector's `?` become
+        # $1, $2, ... and go back to `?` on the wire (OP_QUERY_STREAM_PARAMS).
+        params = Array(call["params"]).map { |p| native(p) }
+        args = params.empty? ? [call["sql"]] : [dollar_placeholders(call["sql"]), params]
         begin
-          res = conn.stream(call["sql"]) do |row|
+          res = conn.stream(*args) do |row|
             columns ||= row.keys
             rows << row.values
           end
