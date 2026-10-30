@@ -67,7 +67,10 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   `ArgumentError`. For a row stream the returned Result has
   `kind == :stream`, the column names in `fields` and no `rows` (they went to
   the block); a statement without rows returns its `:mutation` / `:ddl`
-  Result without yielding. Without a block returns an Enumerator.
+  Result without yielding; a `CALL` whose body `EMIT`s result sets (answered
+  in one frame even when streamed) yields the rows `exec` would return (the
+  last set) and returns that same `:rows` Result, every set under
+  `result_sets`. Without a block returns an Enumerator.
 - `subscribe(stream_name, after: nil, poll: 0.5) { |event| … }` — yields a
   `CREATE STREAM` log's events forever, each a Hash with `"id"`, `"op"`,
   `"k"`, `"ts"`, `"doc"`. Polls `_stream_<name>` 500 rows at a time with a

@@ -237,6 +237,39 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_streamed_call_that_emits_returns_its_result_sets
+    # One ResultSets frame, as exec receives it: [a: x, y] then [b: z].
+    sets = F.result_sets([[%w[a], [["x"], ["y"]]], [%w[b], [["z"]]]])
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(
+        "CALL report(?)" => sets, # with parameters: OP_QUERY_STREAM_PARAMS, $1 sent as ?
+        "CALL report()" => sets,  # without: OP_QUERY_STREAM
+        "SELECT 1" => F.rows(["c"], [[1]])
+      )
+      c = connect(srv)
+      [["CALL report($1)", [5]], ["CALL report()", []]].each do |sql, params|
+        seen = []
+        res = c.stream(sql, params) { |row| seen << row }
+        # the block gets what exec's Result yields: the call's final result ...
+        assert_equal [{ "b" => "z" }], seen, sql
+        # ... and the return value is that Result, every set in order behind it
+        assert_equal [:rows, %w[b], [["z"]]], [res.kind, res.fields, res.rows]
+        assert_equal "xy|z", res.result_sets.map { |s| s.rows.flatten.join }.join("|"), sql
+        assert_equal [%w[a], %w[b]], res.result_sets.map(&:fields)
+        assert c.usable?
+      end
+      assert_equal [9, 5], srv.requests.map(&:op).reject { |op| op == 8 }
+      assert_equal [5], srv.requests.find { |q| q.op == 9 }.params
+      # the Enumerator form; and nothing is in flight, so the block may use the connection
+      assert_equal [{ "b" => "z" }], c.stream("CALL report()").to_a
+      c.stream("CALL report()") { |_| assert_equal 1, c.exec("SELECT 1")[0]["c"] }
+      # nothing was left on the socket: the same connection reads its own reply
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 1, srv.connections
+      c.close
+    end
+  end
+
   def test_unknown_response_tag_is_a_connection_error
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted("SELECT x" => "\x09".b)

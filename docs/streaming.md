@@ -28,6 +28,12 @@ end
 - A non-row statement (an `INSERT`, DDL, `USE`) answers with its ordinary
   result over the same opcode; `stream` returns that Result (`kind`
   `:mutation` with `cmd_tuples`, or `:ddl`) without yielding.
+- A `CALL` whose procedure body `EMIT`s result sets answers with all of them
+  in one frame, as it does to `exec`: the block receives the rows `exec`
+  would return (the call's final result, the last set) and `stream` returns
+  that same `:rows` Result, every set in order under `result_sets`. Nothing
+  is left in flight, so the connection is free again before the first row
+  reaches the block.
 - A server without the streaming opcode raises `Skaidb::QueryError`
   (`server does not support streaming: …`).
 

@@ -55,13 +55,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.3.0/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.4.0/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.3.0.gem`.
+installs without registry access: `gem install ./skaidb-1.4.0.gem`.
 
 ## Quick start
 
@@ -306,7 +306,10 @@ unordered or in storage-key order), and no scan budget applies to a streamed
 page (server ≥ 0.330). With a block `stream` returns a `Result` whose `kind`
 is `:stream` and whose `fields` are the column names (the rows went to the
 block); a non-row statement returns its `:mutation` / `:ddl` Result without
-yielding.
+yielding. A `CALL` whose body `EMIT`s result sets is answered with all of
+them in one frame even when streamed: the block receives the rows `exec`
+would return (the last set), and `stream` returns that same `Result`, every
+set under `result_sets`.
 
 **The abandon/drain rule.** The connection is busy for the whole stream:
 a statement from another thread waits for it. Leaving the block early —
@@ -458,7 +461,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.3.0
+-- ruby | 1.4.0
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after

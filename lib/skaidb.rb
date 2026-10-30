@@ -35,7 +35,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.3.0"
+  VERSION = "1.4.0"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -973,7 +973,12 @@ module Skaidb
     # +kind+ is +:stream+ and +fields+ holds the column names (known even when
     # no row arrived) while +rows+ stays empty — the rows went to the block;
     # a statement that produces no rows returns its ordinary +:mutation+ or
-    # +:ddl+ Result without yielding.
+    # +:ddl+ Result without yielding. A CALL whose body EMITs result sets is
+    # answered with all of them in one frame, streamed or not: the block
+    # receives the rows exec's Result would yield (the call's final result,
+    # the LAST set) and the return value is that same +:rows+ Result, every
+    # set under +result_sets+ — with nothing left in flight, so the block may
+    # use the connection.
     def stream(sql, params = [], consistency: nil)
       return enum_for(:stream, sql, params, consistency: consistency) unless block_given?
       raise ConnectionError, "connection is closed" if @closed
@@ -991,6 +996,7 @@ module Skaidb
 
       live = false
       summary = nil
+      sets = nil
       @mutex.synchronize do
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         begin
@@ -1015,6 +1021,12 @@ module Skaidb
           return Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation) # not row-producing
         when 2
           return Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
+        when 8
+          # ResultSets: a CALL whose body EMITted is answered with every set
+          # in ONE frame, streamed or not — the frame exec receives, decoded
+          # by the same code. Nothing follows it, so the rows are yielded
+          # below, with the connection free.
+          sets = parse_result_sets(r)
         when 5
           # The server has already committed to a row stream, so from here
           # the socket carries frames this call owns — mark it BEFORE
@@ -1064,6 +1076,12 @@ module Skaidb
         else
           raise QueryError, "unexpected response tag #{tag} to stream request"
         end
+      end
+      if sets
+        # What exec's Result yields (the call's final result, the LAST set),
+        # and that same Result back, every set under +result_sets+.
+        sets.each { |row| yield row }
+        return sets
       end
       summary
     end
@@ -1388,27 +1406,9 @@ module Skaidb
       tag = r.u8
       case tag
       when 0 # Rows
-        ncols = r.u32
-        columns = Array.new(ncols) { r.text }
-        nrows = r.u32
-        rows = Array.new(nrows) do
-          ncells = r.u32
-          Array.new(ncells) { Skaidb.decode_value(Reader.new(r.blob)) }
-        end
-        Result.new(fields: columns, rows: rows, cmd_tuples: 0)
+        parse_rows(r)
       when 8 # ResultSets: a CALL whose body EMITted
-        sets = Array.new(r.u32) do
-          ncols = r.u32
-          columns = Array.new(ncols) { r.text }
-          nrows = r.u32
-          rows = Array.new(nrows) do
-            ncells = r.u32
-            Array.new(ncells) { Skaidb.decode_value(Reader.new(r.blob)) }
-          end
-          Result.new(fields: columns, rows: rows, cmd_tuples: 0)
-        end
-        last = sets.last || Result.new(fields: [], rows: [], cmd_tuples: 0)
-        Result.new(fields: last.fields, rows: last.rows, cmd_tuples: 0, result_sets: sets)
+        parse_result_sets(r)
       when 1 # Mutation
         Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation)
       when 2 # Ddl
@@ -1418,6 +1418,29 @@ module Skaidb
       else
         raise ConnectionError, "unknown response tag #{tag}"
       end
+    end
+
+    # A Rows body (PROTOCOL.md §3.2), also one set of ResultSets; +r+ sits
+    # just past the tag.
+    def parse_rows(r)
+      ncols = r.u32
+      columns = Array.new(ncols) { r.text }
+      nrows = r.u32
+      rows = Array.new(nrows) do
+        ncells = r.u32
+        Array.new(ncells) { Skaidb.decode_value(Reader.new(r.blob)) }
+      end
+      Result.new(fields: columns, rows: rows, cmd_tuples: 0)
+    end
+
+    # A ResultSets body (a CALL whose body EMITted), +r+ just past the tag:
+    # the LAST set is the Result's own rows, every set is under
+    # +result_sets+. The buffered path and a stream request both receive
+    # this frame, and both decode it here.
+    def parse_result_sets(r)
+      sets = Array.new(r.u32) { parse_rows(r) }
+      last = sets.last || Result.new(fields: [], rows: [], cmd_tuples: 0)
+      Result.new(fields: last.fields, rows: last.rows, cmd_tuples: 0, result_sets: sets)
     end
   end
 

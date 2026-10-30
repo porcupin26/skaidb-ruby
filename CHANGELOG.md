@@ -4,6 +4,20 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-10-29
+
+### Fixed
+- A streamed `CALL` whose procedure body `EMIT`s result sets returns them.
+  The server answers such a call with every set in one `ResultSets` frame
+  (tag 8) even to a stream request, and `conn.stream`, with or without
+  parameters, raised `QueryError` (`unexpected response tag 8 to stream
+  request`) and lost the sets. The frame is now decoded by the code `exec`
+  uses: the block receives the rows `exec`'s `Result` would yield (the
+  call's final result, the LAST set) and `stream` returns that same `:rows`
+  `Result`, every set in order under `result_sets`. Nothing is left in
+  flight, so the connection stays usable — the block may even run
+  statements on it.
+
 ## [1.3.0] - 2026-10-29
 
 ### Added
