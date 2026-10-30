@@ -284,6 +284,10 @@ module Conformance
 
           next { "rows_then_error" => { "rows" => rows_json(columns, rows), "error" => e.message } }
         end
+        # A row stream is compared by the rows the block saw. Anything else is
+        # the Result stream returned: a non-row statement's, or a CALL that
+        # EMITs — its :rows Result (the block got the last set) carries every
+        # set in order, and result_json reports them all as result_sets.
         res.kind == :stream ? { "rows" => rows_json(res.fields, rows) } : result_json(res)
       end
     when "execute_prepared"
