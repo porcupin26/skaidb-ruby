@@ -166,7 +166,7 @@ class PolicyTest < Minitest::Test
     row = pl.members.first
     assert_equal({ endpoint: a.endpoint, canonical: nil, state: :ready, latency_ms: nil,
                    in_use: 2, idle: 0, seed: true }, row)
-    c1.exec("SELECT 1")
+    3.times { c1.exec("SELECT 1") } # the fastest of the first three seeds a's average
     pl.checkin(c1)
     c2.close # closed while checked out: no longer counted against a
     row = pl.members.first
@@ -199,6 +199,14 @@ end
 
 class EjectionTest < Minitest::Test
   include BalancingHelpers
+
+  # A stand-in for a pooled connection to a member, to feed the pool's
+  # latency measurements round trips of a chosen length.
+  FakeConn = Struct.new(:endpoint, :pool_member)
+
+  def round_trip(pl, member, secs)
+    pl.note_round_trip(FakeConn.new(member.endpoint, member.endpoint), secs)
+  end
 
   def test_a_failing_member_is_ejected_then_readmitted_by_the_probe
     _, b, = @members
@@ -246,6 +254,57 @@ class EjectionTest < Minitest::Test
     b.delay = 0.0
     6.times { who(pl) }
     assert_equal :ready, state(pl, b)
+  end
+
+  def test_a_slow_first_round_trip_does_not_eject_a_member
+    # The first statements on b stall in the client — a CPU-bound
+    # application starting up holds the thread — and b answers fast from
+    # then on: the fastest of its first round trips seeds its average, so b
+    # stays in rotation. (Seeded by its first round trip alone, b's average
+    # still read 3.8 s when it was first compared with the others', and b
+    # was ejected.)
+    a, b, c = @members
+    pl = pool(@members, load_balancing: :round_robin, eject_latency_floor: 0.05)
+    round_trip(pl, b, 6.6)
+    round_trip(pl, b, 3.0)
+    12.times { [a, b, c].each { |m| round_trip(pl, m, 0.0002) } }
+    assert_equal :ready, state(pl, b)
+    assert_operator record(pl, b).ewma, :<, 0.05
+  end
+
+  def test_a_member_slow_from_its_first_round_trip_is_ejected_and_the_warning_names_its_slowest
+    a, b, c = @members
+    log = []
+    logger = Object.new
+    logger.define_singleton_method(:warn) { |msg| log << msg }
+    pl = pool(@members, load_balancing: :round_robin, eject_latency_floor: 0.05, eject_backoff: 30,
+              logger: logger)
+    12.times do |i|
+      round_trip(pl, a, 0.0002)
+      round_trip(pl, c, 0.0002)
+      round_trip(pl, b, i == 5 ? 0.9 : 0.5)
+    end
+    assert_equal :ejected, state(pl, b)
+    ejected = log.grep(/ejecting/)
+    assert_equal 1, ejected.length, log.inspect
+    assert_match(/latency 5\d\d\.\d ms vs median 0\.2 ms/, ejected[0])
+    assert_includes ejected[0], "slowest of the last 10 round trips 900.0 ms"
+  end
+
+  def test_a_readmitted_member_is_seeded_afresh
+    _, b, = @members
+    pl = pool(@members, load_balancing: :round_robin, eject_errors: 1, eject_backoff: 0.2)
+    m = record(pl, b)
+    [0.004, 0.003, 0.002].each { |t| round_trip(pl, b, t) }
+    assert_equal 0.002, m.ewma
+    pl.note_failure(b.endpoint) # ejected; the background probe re-admits it
+    wait_for("b to be re-admitted") { state(pl, b) == :ready }
+    assert_equal [nil, [], [], 0], [m.ewma, m.firsts, m.recent, m.samples]
+    round_trip(pl, b, 0.007)
+    assert_nil m.ewma, "not measured until its first three round trips"
+    round_trip(pl, b, 0.006)
+    round_trip(pl, b, 0.008)
+    assert_equal 0.006, m.ewma # the fastest of its new three, nothing from before
   end
 
   def test_the_last_usable_member_is_never_ejected
@@ -304,10 +363,12 @@ class DiscoveryTest < Minitest::Test
     m = record(pl, c)
     m.ewma = 9.9
     m.samples = 50
+    m.recent << 9.9
     @states[c.endpoint] = "ready"
     refresh(pl)
     assert_nil m.ewma
     assert_equal 0, m.samples
+    assert_empty m.recent
     assert_includes Array.new(6) { who(pl) }, "c"
   end
 

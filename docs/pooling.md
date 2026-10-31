@@ -81,7 +81,7 @@ pool = Skaidb::Pool.new(
 | `idle_order` | `:lifo` | `:lifo` hands out the most recently returned connection first, so a quiet pool keeps few sockets warm. `:fifo` hands out the longest-idle one first, so every idle connection keeps being used and a server-side idle timeout never finds one. |
 | `discover` | `false` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `refresh_interval` (60 s) after — every 5 s while a member is `resyncing` or `unreachable`. New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready` again, when they start with a fresh latency average. An older or standalone server leaves the seeds as they are, and the pool stops asking. |
 | `eject_errors` | `3` | Consecutive transport failures (a failed dial, an I/O error mid-request, a capacity refusal) that eject a member. Statement errors and refused logins do not count. |
-| `eject_latency_factor`, `eject_latency_floor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other usable members' median **and** more than floor seconds above it is ejected (once it and another member have 10 samples each). A factor of `0` disables it. |
+| `eject_latency_factor`, `eject_latency_floor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other usable members' median **and** more than floor seconds above it is ejected (once it and another member have 10 samples each). The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the `logger` warning names the average, the median and the slowest of the member's last 10 round trips. A factor of `0` disables it. |
 | `eject_backoff`, `eject_backoff_max` | `5.0`, `60.0` | How long an ejection lasts, doubling for each repeat up to the max; a member that stays healthy for `eject_backoff_max` after a re-admission starts over at the base. When the time is up a background thread dials the member and runs one statement: success re-admits it (with a fresh latency average), failure ejects it again. The last usable member is never ejected — a slow or flaky member beats none. |
 | `read_your_writes` | `0.0` | Seconds after a write during which checkouts with the same `affinity` go to the member that took the write. |
 | `logger` | `nil` | A `Logger` (or anything with `warn`) told of each ejection and re-admission. |
@@ -94,10 +94,15 @@ through to the other usable members, then to the unusable ones, so a
 checkout never has nowhere to go while any member is configured.
 
 **Latency.** Per member the pool keeps an exponentially weighted average of
-round trips (request sent to the first response frame): each sample moves it
-5 % of the way, and no sample counts for more than 10 × the larger of the
-current average and `eject_latency_floor`. One slow statement barely moves
-it; a member that stays slow is noticed within a few dozen statements.
+round trips (request sent to the first response frame). The fastest of the
+member's first three round trips seeds it: a round trip is only ever
+lengthened — by the member, the network or your own process (a thread that
+stalls while the application starts, say) — so one or two slow first
+statements cannot set it. From then on each sample moves it 5 % of the way,
+and no sample counts for more than 10 × the larger of the current average
+and `eject_latency_floor`. One slow statement barely moves it; a member that
+stays slow is noticed within a few dozen statements. Until its average is
+seeded a member counts as not measured.
 
 **Read-your-writes.** The member that coordinated a write reads it back at
 any consistency, `ONE` included; another member may not have applied it yet.
@@ -139,7 +144,8 @@ endpoint:
 `endpoint` is what the pool dials, `canonical` the name the member reports
 for itself (once discovered), `state` one of `:ready`, `:ejected`,
 `:resyncing`, `:unreachable`, `:unlisted`, and `latency_ms` is `nil` until
-the member has been measured. The rules are the same in every skaidb driver
+the member has been measured (its first three round trips). The rules are
+the same in every skaidb driver
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
 
 ## Behaviour

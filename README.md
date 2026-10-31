@@ -55,13 +55,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.4.0/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.4.1/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.4.0.gem`.
+installs without registry access: `gem install ./skaidb-1.4.1.gem`.
 
 ## Quick start
 
@@ -359,8 +359,11 @@ pool.members # => [{ endpoint: "db1:7000", canonical: "10.0.0.1:7000", state: :r
 
 A member with consecutive transport failures, or a round-trip average far
 above the others', is ejected and re-admitted by a background probe (the last
-usable member never is); `idle_order: :fifo` keeps every idle connection in
-use. Details: [docs/pooling.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/pooling.md).
+usable member never is). The fastest of a member's first three round trips
+seeds its average, so a statement that stalls in your own process cannot get
+a healthy member ejected; a latency ejection's `logger:` warning names the
+average, the median and the slowest of the member's last 10 round trips.
+`idle_order: :fifo` keeps every idle connection in use. Details: [docs/pooling.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/pooling.md).
 
 ## Streams (`CREATE STREAM`)
 
@@ -461,7 +464,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.4.0
+-- ruby | 1.4.1
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after

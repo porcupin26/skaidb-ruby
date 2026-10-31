@@ -35,7 +35,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.4.0"
+  VERSION = "1.4.1"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -1568,13 +1568,18 @@ module Skaidb
   class Pool
     POLICIES = %i[random round_robin least_latency].freeze
     IDLE_ORDERS = %i[lifo fifo].freeze
-    # Latency EWMA: each round trip moves a member's average 5% toward it,
-    # and no sample counts for more than 10x the larger of the current
-    # average and the ejection floor — one slow query does not eject a
-    # healthy member, a member that stays slow is ejected within a few dozen
-    # statements.
+    # Latency EWMA: the fastest of a member's first round trips seeds it (a
+    # round trip is only ever lengthened — by the member, the network or this
+    # process stalling — so a slow first statement cannot set it); then each
+    # round trip moves it 5% toward it, and no sample counts for more than
+    # 10x the larger of the current average and the ejection floor — one slow
+    # query does not eject a healthy member, a member that stays slow is
+    # ejected within a few dozen statements.
+    EWMA_SEED_SAMPLES = 3
     EWMA_WEIGHT = 0.05
     EWMA_CLAMP = 10.0
+    # Round trips a latency ejection's warning reports the slowest of.
+    RECENT_SAMPLES = 10
     # Round trips a member (and at least one other) needs before its average
     # can eject it.
     EWMA_MIN_SAMPLES = 10
@@ -1591,12 +1596,13 @@ module Skaidb
     MAINTAIN_TICK = 0.25
     # Read-your-writes keys kept before the expired ones are swept.
     AFFINITY_SWEEP = 4096
-    private_constant :EWMA_WEIGHT, :EWMA_CLAMP, :EWMA_MIN_SAMPLES, :STALE_SAMPLE,
-                     :REFRESH_NOT_READY, :MAINTAIN_TICK, :AFFINITY_SWEEP
+    private_constant :EWMA_SEED_SAMPLES, :EWMA_WEIGHT, :EWMA_CLAMP, :RECENT_SAMPLES,
+                     :EWMA_MIN_SAMPLES, :STALE_SAMPLE, :REFRESH_NOT_READY, :MAINTAIN_TICK,
+                     :AFFINITY_SWEEP
 
     # One member as the pool sees it.
     class Member
-      attr_reader :endpoint, :host, :port, :seed
+      attr_reader :endpoint, :host, :port, :seed, :firsts, :recent
       attr_accessor :canonical, :listed, :ewma, :samples, :last_sample, :errors,
                     :ejected_until, :ejections, :readmitted_at, :in_use, :probing
 
@@ -1608,6 +1614,8 @@ module Skaidb
         @canonical = nil              # its own SHOW ENDPOINTS name
         @listed = :ready              # :ready, :resyncing, :unreachable, :unlisted
         @ewma = nil                   # seconds
+        @firsts = []                  # round trips before the average is seeded
+        @recent = []                  # the last RECENT_SAMPLES round trips
         @samples = 0
         @last_sample = 0.0
         @errors = 0                   # consecutive transport failures
@@ -1616,6 +1624,14 @@ module Skaidb
         @readmitted_at = 0.0
         @in_use = 0
         @probing = false
+      end
+
+      # Measure the member afresh (a re-admission, back to ready).
+      def reset_latency
+        @ewma = nil
+        @firsts.clear
+        @recent.clear
+        @samples = 0
       end
     end
     private_constant :Member
@@ -1787,15 +1803,21 @@ module Skaidb
         next if m.nil?
 
         m.errors = 0
+        m.recent.push(elapsed)
+        m.recent.shift if m.recent.length > RECENT_SAMPLES
         if m.ewma.nil?
-          m.ewma = elapsed
+          m.firsts.push(elapsed)
+          if m.firsts.length >= EWMA_SEED_SAMPLES
+            m.ewma = m.firsts.min
+            m.firsts.clear
+          end
         else
           cap = EWMA_CLAMP * [m.ewma, @eject_floor].max
           m.ewma += EWMA_WEIGHT * ([elapsed, cap].min - m.ewma)
         end
         m.samples += 1
         m.last_sample = now
-        next unless m.samples >= EWMA_MIN_SAMPLES && @eject_factor.positive? && m.ejected_until.nil?
+        next unless m.ewma && m.samples >= EWMA_MIN_SAMPLES && @eject_factor.positive? && m.ejected_until.nil?
 
         others = @members.each_value.select do |o|
           !o.equal?(m) && usable?(o) && o.ewma && o.samples >= EWMA_MIN_SAMPLES
@@ -1804,7 +1826,9 @@ module Skaidb
 
         median = others[(others.length - 1) / 2]
         if m.ewma > @eject_factor * median && m.ewma - median > @eject_floor
-          eject(m, format("latency %.1f ms vs median %.1f ms", m.ewma * 1000, median * 1000))
+          eject(m, format("latency %.1f ms vs median %.1f ms; " \
+                          "slowest of the last %d round trips %.1f ms",
+                          m.ewma * 1000, median * 1000, m.recent.length, m.recent.max * 1000))
         end
       end
     end
@@ -2009,8 +2033,7 @@ module Skaidb
         if ok && !@closed
           m.ejected_until = nil
           m.errors = 0
-          m.ewma = nil
-          m.samples = 0
+          m.reset_latency
           m.readmitted_at = now
           log("re-admitted #{m.endpoint}")
           if @idle.length < @maxsize
@@ -2112,8 +2135,7 @@ module Skaidb
         state = %w[ready resyncing unreachable].include?(state) ? state.to_sym : :ready
         if state == :ready && m.listed != :ready
           # Back in rotation: measured afresh, like a re-admission.
-          m.ewma = nil
-          m.samples = 0
+          m.reset_latency
           m.errors = 0
         end
         m.listed = state
