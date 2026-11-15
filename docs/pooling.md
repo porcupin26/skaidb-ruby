@@ -44,6 +44,7 @@ Skaidb::Pool.new(
 )
 
 pool.with(affinity: nil) { |conn| … }   # the block's value
+pool.transaction(attempts: 3, begin: "BEGIN", affinity: nil) { |conn| … }   # the block's value
 pool.checkout(affinity: nil)  -> Skaidb::Connection
 pool.checkin(conn)
 pool.members                  -> Array of Hashes (see "Watching it")
@@ -161,6 +162,14 @@ the same in every skaidb driver
   and will fail its first statement with `Skaidb::ConnectionError`; that
   failure marks it broken, so `checkin` discards it and the next checkout
   gets a fresh one. Retry the statement in that case if it is safe to.
+- A transaction belongs to one connection. `pool.transaction { |conn| … }`
+  checks one out, runs `Connection#transaction` on it (`begin`, the block,
+  `COMMIT`, the whole of it again when the `COMMIT` is refused with
+  `Skaidb::TransactionConflict`) and checks it in afterwards; separate
+  `pool.with` calls may each get a different connection, and statements
+  sent that way are not one transaction. A `TransactionConflict` is a
+  statement error: it does not count against the member and the connection
+  goes back to the idle set.
 - `close` marks the pool closed, closes the idle connections and stops the
   background thread; connections checked out at the time are closed when
   they are returned. `checkout` on a closed pool raises `Skaidb::Error`.

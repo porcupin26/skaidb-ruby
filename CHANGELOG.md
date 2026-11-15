@@ -4,6 +4,62 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-15
+
+### Added
+- **`Skaidb::TransactionConflict`**, a `QueryError` raised for a server
+  error whose message starts with `transaction conflict:` — what a
+  standalone server (≥ 0.346) answers a `COMMIT` with when another writer
+  changed a row the transaction writes after its `BEGIN`. Nothing was
+  applied, the transaction is over and the connection stays usable; the
+  message is the server's, unchanged. Every call that runs a statement
+  raises it (`exec`, `exec_params`, `exec_prepared`, `exec_batch`,
+  `stream`), and `rescue Skaidb::QueryError` catches it as before. It is a
+  statement error: it does not count against a pool member's health, close
+  the connection or cause a re-dial.
+- **`conn.transaction(attempts: 3, begin: "BEGIN") { |conn| … }`** sends
+  `begin`, runs the block, sends `COMMIT` and returns the block's value. A
+  `COMMIT` refused with `TransactionConflict` runs the whole transaction
+  again from `begin` — up to `attempts` runs in all, with no pause between
+  them — so the block must be safe to run more than once; the conflict of
+  the last attempt is raised. A refused `begin` is raised without running
+  the block or sending anything else. A block that does not run to its end
+  (an exception, `break`, `throw`) is rolled back and never retried, and
+  what the `ROLLBACK` answers never replaces the block's exception. Any
+  other `COMMIT` error is raised with no retry and no `ROLLBACK`. `begin:`
+  is the opening statement, sent as given (`BEGIN ATOMIC` or
+  `BEGIN ATOMIC PARTITION (col = lit)` on a cluster). `attempts` below 1,
+  or no block, raises `ArgumentError` before anything is sent.
+- Inside `transaction` a connection that loses its transport does not
+  re-dial: the `ConnectionError` is not retried, no `ROLLBACK` is sent to a
+  new session, and a statement the block still runs after rescuing the
+  failure raises `ConnectionError` instead of being committed on its own
+  there. The first statement after `transaction` returns re-dials as always.
+- **`pool.transaction(attempts: 3, begin: "BEGIN", affinity: nil) { |conn| … }`**:
+  the same helper on one checked-out connection, held for every attempt and
+  returned afterwards.
+
+### Fixed
+- A statement cut short between its request and its reply by something
+  other than a transport error — `Timeout.timeout`, an `Interrupt`,
+  `Thread#kill` — left the reply on the socket with `usable?` still `true`,
+  and the next statement on that connection read it as its own: a
+  `SELECT 1` returned the rows of the statement that had timed out. The
+  connection is now marked broken at that point, so `usable?` is `false`, a
+  pool closes it on check-in and the next statement re-dials. `exec`,
+  `exec_params`, `exec_batch` and the first frame of a `stream` are covered.
+  `transaction` relies on it: a block cut short that way is not followed by
+  a `ROLLBACK` that would wait for the outstanding reply.
+- A broken connection is re-dialled by whichever statement comes next. A
+  parameterised statement the connection had already prepared
+  (`exec_params`, `exec_batch`) took its id from the cache before that
+  check and sent it down the old socket, so a connection that ran only
+  such statements raised `ConnectionError` on every call after a transport
+  failure and never recovered. The cache is now read after the re-dial,
+  which empties it. `exec_prepared` with an id from before the failure
+  raises `ConnectionError` (`connection is broken; prepare the statement
+  again`).
+
 ## [1.4.1] - 2026-10-31
 
 ### Fixed
@@ -224,6 +280,7 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.5.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.2.0...v1.3.0

@@ -35,7 +35,7 @@ require "bigdecimal"
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.4.1"
+  VERSION = "1.5.0"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end
@@ -47,6 +47,35 @@ module Skaidb
   # A statement failed (bad SQL, constraint violation, ...). The connection
   # stays usable for the next query.
   class QueryError < Error; end
+
+  # The server refused a COMMIT because another writer changed a row the
+  # transaction writes after its BEGIN. Nothing was applied and the
+  # transaction is over: the connection is back in autocommit and stays
+  # usable, and running the whole transaction again from BEGIN is safe —
+  # which is what Connection#transaction does. A QueryError like any other
+  # statement error, so +rescue Skaidb::QueryError+ catches it too; the
+  # message is the server's.
+  class TransactionConflict < QueryError
+    # What the server's message starts with (PROTOCOL.md §6 rule 6). Only the
+    # prefix is matched: the rest of the text may change.
+    PREFIX = "transaction conflict:"
+  end
+
+  # Internal: the error for a server Error frame's message — a
+  # TransactionConflict when it starts with the conflict prefix, a QueryError
+  # otherwise, the message unchanged either way.
+  def self.statement_error(message)
+    (message.start_with?(TransactionConflict::PREFIX) ? TransactionConflict : QueryError).new(message)
+  end
+
+  # Internal: the argument checks of Connection#transaction and
+  # Pool#transaction, made before anything is sent.
+  def self.check_transaction_arguments(attempts, has_block)
+    raise ArgumentError, "transaction needs a block" unless has_block
+    return if attempts.is_a?(Integer) && attempts >= 1
+
+    raise ArgumentError, "attempts must be an Integer >= 1, got #{attempts.inspect}"
+  end
 
   # Consistency levels — how many replicas must acknowledge/answer.
   module Consistency
@@ -715,6 +744,9 @@ module Skaidb
       @broken = false
       # A stream is in flight, so the socket sits mid-reply (see stream).
       @streaming = false
+      # The transaction helper is between its BEGIN and its COMMIT/ROLLBACK,
+      # so a lost socket must not be re-dialled (see ensure_live!).
+      @in_transaction = false
       @prepared = {}
       @last_prepare_error = nil
       # Retained so a reconnect repeats the original connect exactly.
@@ -926,6 +958,82 @@ module Skaidb
       n
     end
 
+    # Run the block inside a transaction on this connection and return the
+    # block's value: +begin+, the block (handed the connection), COMMIT.
+    #
+    #   conn.transaction do |c|
+    #     c.exec_params("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [10, 1])
+    #     c.exec_params("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [10, 2])
+    #   end
+    #
+    # A COMMIT the server refuses with TransactionConflict (another writer
+    # changed a row the transaction writes; nothing was applied) starts the
+    # whole thing again from +begin+ — up to +attempts+ runs in all, with no
+    # pause between them: the other writer has already finished, and the next
+    # run reads the rows as they are now. So the block may run MORE THAN
+    # ONCE: it must be safe to repeat, and should do nothing outside the
+    # database that a repeat would do twice. The conflict of the last attempt
+    # is raised.
+    #
+    # +begin+ is the opening statement, sent as given: "BEGIN" on a
+    # standalone server, "BEGIN ATOMIC" or "BEGIN ATOMIC PARTITION (col =
+    # lit)" on a cluster.
+    #
+    # - +begin+ refused: its error is raised, the block never runs and
+    #   nothing else is sent (the block's statements would autocommit one by
+    #   one).
+    # - The block does not run to its end — an exception of any class,
+    #   +break+, +throw+ or a +return+ out of it: ROLLBACK is sent, and what
+    #   the block was leaving with carries on unchanged whatever the ROLLBACK
+    #   itself answers. Nothing is retried, a TransactionConflict raised in
+    #   the block included.
+    # - Any other COMMIT error is raised as it is. A failed COMMIT has ended
+    #   the transaction, so no ROLLBACK follows and nothing is retried.
+    # - A transport failure is the usual ConnectionError and is not retried.
+    #   The transaction lived on the socket that died, so until the helper
+    #   returns the connection does not re-dial: no ROLLBACK is sent, and a
+    #   statement the block still runs after rescuing the failure raises
+    #   ConnectionError instead of autocommitting on a new session. The same
+    #   goes for a block cut short in the middle of a round trip (an
+    #   Interrupt, a Timeout): the reply is still on its way, so nothing more
+    #   is written to that socket.
+    #
+    # The whole transaction runs on this one connection, so no other thread
+    # may use it meanwhile. +attempts+ below 1, or no block, is an
+    # ArgumentError raised before anything is sent.
+    def transaction(attempts: 3, begin: "BEGIN")
+      opening = binding.local_variable_get(:begin) # +begin+ is a keyword, so the local has no other name
+      Skaidb.check_transaction_arguments(attempts, block_given?)
+
+      enclosing = @in_transaction
+      attempt = 0
+      begin
+        attempt += 1
+        committing = false
+        exec(opening)
+        @in_transaction = true
+        finished = false
+        begin
+          value = yield self
+          finished = true
+        ensure
+          rollback_quietly unless finished
+        end
+        committing = true
+        exec("COMMIT")
+        value
+      rescue TransactionConflict
+        # Only a refused COMMIT is run again; a conflict the block raised
+        # was rolled back above, and one from +begin+ opened nothing.
+        raise unless committing && attempt < attempts
+
+        @in_transaction = enclosing
+        retry
+      ensure
+        @in_transaction = enclosing
+      end
+    end
+
     # Stream a result set: yields one row Hash at a time while holding a
     # single chunk, instead of buffering the whole result. For exports and
     # large scans.
@@ -1000,8 +1108,7 @@ module Skaidb
       @mutex.synchronize do
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         begin
-          write_frame(req)
-          r = Reader.new(read_frame)
+          r = Reader.new(round_trip(req))
         rescue ConnectionError
           observe_failure
           raise
@@ -1016,7 +1123,7 @@ module Skaidb
             what = params.empty? ? "streaming" : "parameterised streaming (skaidb >= 0.330)"
             raise QueryError, "server does not support #{what}: #{msg}"
           end
-          raise QueryError, msg
+          raise Skaidb.statement_error(msg)
         when 1
           return Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation) # not row-producing
         when 2
@@ -1056,7 +1163,7 @@ module Skaidb
                 live = false
               when 3
                 live = false
-                raise QueryError, fr.text
+                raise Skaidb.statement_error(fr.text)
               else
                 # Mid-stream the server sends only RowsChunk, RowsEnd or Error.
                 # Anything else means we no longer know where the reply ends, so
@@ -1090,10 +1197,12 @@ module Skaidb
     # server declines the statement kind (DDL, session statements) so the
     # caller falls back to text binding. Cached per connection.
     def prepare_server(sql)
+      raise ConnectionError, "connection is closed" if @closed
+      # Before the cache is read: a re-dial empties it, and a cached id must
+      # not send a statement down a socket that is broken.
+      ensure_live!
       hit = @prepared[sql]
       return hit if hit
-      raise ConnectionError, "connection is closed" if @closed
-      ensure_live!
 
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
@@ -1116,9 +1225,12 @@ module Skaidb
       end
     end
 
-    # Execute a prepared statement with TYPED parameters.
+    # Execute a prepared statement with TYPED parameters. The id belongs to
+    # the socket that prepared it, so a broken connection is not re-dialled
+    # here: prepare_server does that, and hands out a new id.
     def exec_prepared(id, params, consistency)
       raise ConnectionError, "connection is closed" if @closed
+      raise ConnectionError, "connection is broken; prepare the statement again" if @broken
 
       req = +([3, consistency].pack("CC") + [id].pack("V") + [params.length].pack("v"))
       params.each do |p|
@@ -1210,6 +1322,10 @@ module Skaidb
     def ensure_live!
       raise ConnectionError, "connection is closed" if @closed
       return unless @broken
+      # A transaction lives on the socket that carried its BEGIN. Re-dialling
+      # inside the helper would run the rest of the block, and the COMMIT, on
+      # a new session with no transaction open: each statement autocommitted.
+      raise ConnectionError, "connection lost inside a transaction; not re-dialling until it ends" if @in_transaction
 
       @prepared.clear
       begin
@@ -1338,6 +1454,19 @@ module Skaidb
 
     # -- query --
 
+    # The transaction helper's clean-up after a block that did not run to its
+    # end. It runs while something else is unwinding, so it never raises: a
+    # ROLLBACK the server refuses (one before 0.347 answers "no transaction in
+    # progress" when nothing is open) or that dies in transport must not
+    # replace what the block left with. Not sent on a connection that is not
+    # usable — its socket died, or was left in the middle of a reply: the
+    # transaction goes with the socket.
+    def rollback_quietly
+      exec("ROLLBACK") if usable?
+    rescue StandardError
+      nil
+    end
+
     def run(sql, consistency)
       raise ConnectionError, "connection is closed" if @closed
       ensure_live!
@@ -1380,16 +1509,30 @@ module Skaidb
     def request(req)
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       frame = begin
-        @mutex.synchronize do
-          write_frame(req)
-          read_frame
-        end
+        @mutex.synchronize { round_trip(req) }
       rescue ConnectionError
         observe_failure
         raise
       end
       @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
       Reader.new(frame)
+    end
+
+    # Write a request and read the first frame of its reply (the caller holds
+    # @mutex). Leaving in between — on a transport error, but also on an
+    # Interrupt, a Timeout or Thread#kill, which no rescue here sees — means
+    # the reply is still on its way: the socket no longer sits at a request
+    # boundary, and the next statement would read this one's reply as its
+    # own. So the connection is marked broken: usable? turns false, a pool
+    # drops it, and the next statement re-dials.
+    def round_trip(req)
+      answered = false
+      write_frame(req)
+      frame = read_frame
+      answered = true
+      frame
+    ensure
+      @broken = true unless answered
     end
 
     def observe_failure
@@ -1414,7 +1557,7 @@ module Skaidb
       when 2 # Ddl
         Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
       when 3 # Error — a statement error, connection stays usable
-        raise QueryError, r.text
+        raise Skaidb.statement_error(r.text)
       else
         raise ConnectionError, "unknown response tag #{tag}"
       end
@@ -1744,6 +1887,20 @@ module Skaidb
       ensure
         checkin(conn)
       end
+    end
+
+    # Run the block inside a transaction on ONE checked-out connection and
+    # return the block's value: Connection#transaction, with the same
+    # +attempts+ and +begin+, on a connection held for the whole transaction
+    # — every attempt included — and returned afterwards. +affinity+ scopes
+    # read-your-writes, as in +with+.
+    #
+    #   pool.transaction { |conn| conn.exec_params("UPDATE … WHERE id = $1", [id]) }
+    def transaction(attempts: 3, begin: "BEGIN", affinity: nil, &block)
+      opening = binding.local_variable_get(:begin) # +begin+ is a keyword, so the local has no other name
+      Skaidb.check_transaction_arguments(attempts, block_given?)
+
+      with(affinity: affinity) { |conn| conn.transaction(attempts: attempts, begin: opening, &block) }
     end
 
     # The members as the pool sees them, for monitoring: one Hash each with

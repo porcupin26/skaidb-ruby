@@ -327,6 +327,87 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_round_trip_cut_short_retires_the_socket_instead_of_leaving_its_reply_to_the_next_statement
+    interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with: not a StandardError
+    calls = {
+      "exec" => ->(c) { c.exec("SELECT slow") },
+      "stream" => ->(c) { c.stream("SELECT slow") { |_| nil } }
+    }
+    cuts = {
+      "an exception raised into the thread" => ->(thread) { thread.raise(interrupt) },
+      "Thread#kill" => ->(thread) { thread.kill }
+    }
+    calls.to_a.product(cuts.to_a).each do |(call_name, call), (cut_name, cut)|
+      what = "#{call_name}, cut short by #{cut_name}"
+      with_server do |srv|
+        gate = Queue.new # the server sits on the statement until the gate opens
+        slow = lambda do |req, _conn|
+          gate.pop
+          req.op == 5 ? [F.header(["c"]), F.chunk([["slow"]]), F.rows_end] : F.rows(["c"], [["slow"]])
+        end
+        srv.handler = FakeSkaidb.scripted(
+          { "SELECT slow" => slow, "SELECT 1" => F.rows(["c"], [[1]]) },
+          prepared: { "SELECT ?" => 1 }, on_execute: ->(_s, req) { F.rows(["p"], [[req.params[0]]]) }
+        )
+        c = connect(srv)
+        assert_equal 7, c.exec_params("SELECT $1", [7])[0]["p"] # prepared, and cached
+        worker = Thread.new do
+          Thread.current.report_on_exception = false
+          call.call(c)
+        end
+        until_true { srv.requests.any? { |q| q.sql == "SELECT slow" } } # the request is out, its reply is not
+        cut.call(worker)
+        begin
+          worker.join(5) || flunk("#{what}: the thread did not end")
+        rescue interrupt
+          nil
+        end
+        # no transport error happened, yet the socket is no longer at a request boundary
+        refute c.usable?, what
+        gate << true # the late reply now arrives on the old socket
+        # the next statement reads its own reply, on a new socket — a cached
+        # prepared statement included (prepared again there)
+        assert_equal 8, c.exec_params("SELECT $1", [8])[0]["p"], what
+        assert_equal 1, c.exec("SELECT 1")[0]["c"], what
+        assert_equal 2, srv.connections, what
+        assert_equal 2, srv.requests.count { |q| q.op == 2 }, what
+        c.close
+      end
+    end
+  end
+
+  def test_a_cached_parameterised_statement_re_dials_a_lost_connection_too
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(
+        {}, prepared: { "SELECT ?" => 1, "INSERT INTO t (id) VALUES (?)" => 1 },
+        on_execute: ->(_s, req) { F.rows(["p"], [[req.params[0]]]) }
+      )
+      c = connect(srv)
+      assert_equal 7, c.exec_params("SELECT $1", [7])[0]["p"]
+      assert_equal 2, c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[1], [2]])
+      srv.close_all
+      assert_raises(Skaidb::ConnectionError) { c.exec_params("SELECT $1", [8]) } # discovers the loss
+      refute c.usable?
+      # the cached id is not sent down the dead socket: re-dialled, prepared again
+      assert_equal 9, c.exec_params("SELECT $1", [9])[0]["p"]
+      assert c.usable?
+      assert_equal 2, srv.connections
+      assert_equal 3, srv.requests.count { |q| q.op == 2 }
+      srv.close_all
+      assert_raises(Skaidb::ConnectionError) { c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[3]]) }
+      assert_equal 1, c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[3]])
+      assert_equal 3, srv.connections
+      # an id handed out by prepare_server does not outlive its socket
+      id, = c.prepare_server("SELECT ?")
+      srv.close_all
+      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [1], 1) }
+      e = assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [1], 1) }
+      assert_equal "connection is broken; prepare the statement again", e.message
+      assert_equal 3, srv.connections
+      c.close
+    end
+  end
+
   def test_pool_reuses_idle_connections_and_discards_broken_ones
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted("SELECT 1" => F.rows(["c"], [[1]]))

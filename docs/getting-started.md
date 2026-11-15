@@ -93,6 +93,23 @@ Rows arrive chunk by chunk; the driver holds one chunk at a time. See
 [streaming.md](streaming.md), in particular what happens when you leave the
 block early.
 
+## Transactions
+
+```ruby
+conn.transaction do |c|              # BEGIN, the block, COMMIT; returns the block's value
+  c.exec_params("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [10, 1])
+  c.exec_params("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [10, 2])
+end
+```
+
+A block that raises is rolled back. A `COMMIT` the server refuses because
+another writer changed a row the transaction writes raises
+`Skaidb::TransactionConflict` with nothing applied, and `transaction` then
+runs the block again (three runs in all by default), so the block must be
+safe to run more than once. On a cluster pass the opening statement:
+`conn.transaction(begin: "BEGIN ATOMIC") { |c| … }`. Details:
+[api.md](api.md#transactions).
+
 ## Errors
 
 ```ruby
@@ -105,7 +122,8 @@ rescue Skaidb::ConnectionError => e  # transport/handshake trouble; next stateme
 end
 ```
 
-Both inherit from `Skaidb::Error`.
+Both inherit from `Skaidb::Error`. `Skaidb::TransactionConflict` is a
+`QueryError`.
 
 ## Close
 

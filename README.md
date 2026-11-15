@@ -12,9 +12,9 @@ and the result behaves like `PG::Result`. **Pure standard library** (`socket`,
 `openssl`, `securerandom`, `bigdecimal`) — no third-party code, one file,
 Ruby 2.7 through 3.4. It speaks skaidb's binary protocol directly:
 SCRAM-SHA-256 authentication, server-side prepared statements with typed
-parameters, one-round-trip batches, streamed result sets, multi-seed failover,
-transparent reconnect, TLS and a connection pool that balances across the
-cluster's members.
+parameters, one-round-trip batches, streamed result sets, a retrying
+transaction helper, multi-seed failover, transparent reconnect, TLS and a
+connection pool that balances across the cluster's members.
 
 - Repository: <https://github.com/porcupin26/skaidb-ruby>
 - RubyGems: <https://rubygems.org/gems/skaidb>
@@ -55,13 +55,13 @@ Xcode command-line tools on macOS). `gem install skaidb` and vendoring reuse
 the `bigdecimal` already installed.
 
 Or vendor the single file: copy
-[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.4.1/lib/skaidb.rb)
+[`lib/skaidb.rb`](https://github.com/porcupin26/skaidb-ruby/blob/v1.5.0/lib/skaidb.rb)
 into your project and `require_relative` it. It has no dependencies beyond
 Ruby's standard library.
 
 Every release is also attached as a `.gem` to its
 [GitHub release](https://github.com/porcupin26/skaidb-ruby/releases) for
-installs without registry access: `gem install ./skaidb-1.4.1.gem`.
+installs without registry access: `gem install ./skaidb-1.5.0.gem`.
 
 ## Quick start
 
@@ -104,7 +104,8 @@ end
 - [Streams (`CREATE STREAM`)](#streams-create-stream) — `subscribe`
 - [Type mapping](#type-mapping)
 - [Errors](#errors)
-- [Transactions](#transactions)
+- [Transactions](#transactions) — `transaction`, `TransactionConflict`,
+  hand-written `BEGIN`/`COMMIT`
 - [Thread safety](#thread-safety)
 - [Client identification and version](#client-identification-and-version)
 - [Compatibility](#compatibility)
@@ -155,7 +156,9 @@ through.
 `timeout` bounds the TCP dial only. Reads have no deadline: a peer that is
 alive but silent blocks the caller, as in ruby-pg. `close` deliberately does
 not take the connection's lock, so another thread can break a stuck read by
-closing the connection.
+closing the connection. A statement cut short while its reply is outstanding
+— by `Timeout.timeout`, an `Interrupt`, `Thread#kill` — leaves the connection
+marked broken, so the next statement re-dials instead of reading that reply.
 
 ### TLS
 
@@ -202,8 +205,8 @@ the server regardless of this setting.
 ### Health
 
 - `conn.usable?` — no round-trip. `true` unless the connection is closed, was
-  left out of sync by a transport error or an undrainable abandoned stream, or
-  is currently mid-stream.
+  left out of sync by a transport error, a round trip cut short or an
+  undrainable abandoned stream, or is currently mid-stream.
 - `conn.closed` / `conn.finished?` — `true` after `close`.
 
 ## Statements and parameters
@@ -429,24 +432,113 @@ StandardError
 └── Skaidb::Error                # also: invalid consistency, pool closed
     ├── Skaidb::ConnectionError  # dial/auth/transport failures, framing, closed connection
     └── Skaidb::QueryError       # the server rejected the statement; bad parameters
+        └── Skaidb::TransactionConflict  # a COMMIT refused: another writer changed a row it writes
 ```
 
 - A server `Error` frame is a **statement** error (`QueryError`); the
   connection stays usable.
+- A server error whose message starts with `transaction conflict:` is a
+  `TransactionConflict`, from every call that runs a statement. It is a
+  `QueryError`, so `rescue Skaidb::QueryError` catches it too; see
+  [Transactions](#transactions).
 - A transport failure (`ConnectionError`) marks the connection broken; the
-  next statement re-dials, or a pool replaces it.
+  next statement re-dials, or a pool replaces it. So does anything else that
+  cuts a statement short between its request and its reply (an `Interrupt`,
+  a `Timeout`); that exception propagates as it is.
 - `ArgumentError` for `Pool.new(maxsize: 0)` or an unknown
   `load_balancing`/`idle_order`, for `Skaidb::Uuid.new` of a string that
-  is not a UUID, and for `stream` parameters that are not an Array.
+  is not a UUID, for `stream` parameters that are not an Array, and for
+  `transaction` with `attempts` below 1 or without a block.
 
 ## Transactions
 
-skaidb autocommits every statement. There is no `BEGIN` on this driver's API;
-where your server supports statement-level transaction control, issue
-`BEGIN`/`COMMIT`/`ROLLBACK` as ordinary statements. **On a cluster,
-transaction control is not available** — a `BEGIN` there is refused by the
-server as a statement error. See the server documentation for what your
-deployment supports.
+skaidb autocommits every statement outside a transaction. A transaction is
+ordinary statements on **one connection**: an opening statement, the
+statements, then `COMMIT` or `ROLLBACK`. `conn.transaction` does that around
+a block and returns the block's value:
+
+```ruby
+conn.transaction do |c|
+  c.exec_params("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [10, 1])
+  c.exec_params("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [10, 2])
+end
+
+conn.transaction(attempts: 5, begin: "BEGIN ATOMIC") { |c| … }
+pool.transaction { |c| … }      # one checked-out connection for all of it
+```
+
+`begin:` is the opening statement, sent as given: `"BEGIN"` (the default) on
+a standalone server; a cluster takes `BEGIN ATOMIC` or
+`BEGIN ATOMIC PARTITION (col = lit)`. The rest is the same on both.
+
+**Conflicts.** A standalone server (≥ 0.346) refuses a `COMMIT` when another
+writer changed a row the transaction writes after its `BEGIN`. Nothing was
+applied, the transaction is over, and the connection is back in autocommit
+and stays usable. The driver raises `Skaidb::TransactionConflict` for it — a
+`QueryError` carrying the server's message, recognised by its
+`transaction conflict:` prefix, from `exec` and every other call as well as
+from the helper. Running the whole transaction again from its opening
+statement is safe, and that is what `transaction` does: up to `attempts` runs
+in all (default 3), with no pause between them — the other writer has
+already finished, and the next run reads the rows as they are now. So **the
+block must be safe to run more than once**, and should do nothing outside the
+database that a repeat would do twice. The conflict of the last attempt is
+raised.
+
+What else `transaction` does:
+
+- The opening statement is refused: its error is raised, the block never
+  runs and nothing else is sent.
+- The block does not run to its end (an exception, `break`, `throw`):
+  `ROLLBACK` is sent, and the block's exception propagates unchanged
+  whatever the `ROLLBACK` itself answers. Nothing is retried, a
+  `TransactionConflict` raised inside the block included.
+- Any other `COMMIT` error is raised as it is, with no retry and no
+  `ROLLBACK`: a `COMMIT` that fails has ended the transaction.
+- A transport failure is the usual `ConnectionError` and is not retried. The
+  transaction lived on the socket that died, so until `transaction` returns
+  the connection does not re-dial: no `ROLLBACK` is sent, and a statement the
+  block still runs after rescuing the failure raises `ConnectionError`
+  instead of running on a new session. The same goes for a block cut short
+  in the middle of a round trip (an `Interrupt`, a `Timeout`): the reply is
+  still on its way, so nothing more is written to that socket.
+- `pool.transaction(attempts: 3, begin: "BEGIN", affinity: nil)` checks one
+  connection out, runs every attempt on it, and returns it afterwards.
+
+Written by hand, the same transaction is:
+
+```ruby
+conn.exec("BEGIN")                 # if this raises, stop here
+begin
+  conn.exec_params("UPDATE accounts SET balance = balance - $1 WHERE id = $2", [10, 1])
+  conn.exec_params("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [10, 2])
+rescue StandardError
+  begin
+    conn.exec("ROLLBACK") if conn.usable?
+  rescue Skaidb::Error
+    nil                            # the clean-up never replaces the error it follows
+  end
+  raise
+end
+conn.exec("COMMIT")                # Skaidb::TransactionConflict: nothing was applied; run it again from BEGIN
+```
+
+Two rules hold however the statements are sent:
+
+- **One connection for the whole transaction.** Statements sent on another
+  connection are not part of it, so with a pool check one connection out
+  (`pool.with`) and keep it until the `COMMIT`; a statement another thread
+  sends on that connection meanwhile is part of it. A `ConnectionError` ends
+  the transaction with its socket; the connection's next statement re-dials
+  and runs on a new session, in autocommit. That is why the example sends
+  `ROLLBACK` only while the connection is `usable?`.
+- **Stop if `BEGIN` fails.** No transaction is open, so every statement sent
+  after it would be committed on its own.
+
+A statement that fails inside a transaction leaves it open: decide between
+`ROLLBACK` and carrying on. A `ROLLBACK` with no transaction open succeeds on
+a server ≥ 0.347 and is a statement error (`no transaction in progress`) on
+an older one.
 
 ## Thread safety
 
@@ -464,7 +556,7 @@ frame after every handshake. It shows up as `client_name = 'ruby'` /
 
 ```sql
 SELECT client_name, client_version FROM drivers;
--- ruby | 1.4.1
+-- ruby | 1.5.0
 ```
 
 The server records the row asynchronously, so a `SELECT` immediately after

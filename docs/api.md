@@ -52,6 +52,9 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   (which names the failing row index; earlier rows stay applied).
 - `exec_prepared(id, params, consistency) → Result` — run a statement by the
   id `prepare_server` returned, with an Array of typed values in `?` order.
+  The id is valid on the socket that prepared it: on a broken connection
+  this raises `ConnectionError` instead of re-dialing, and `prepare_server`
+  hands out a new id.
 - `prepare_server(sql) → [id, nparams] | nil` — prepare a statement with `?`
   placeholders on the server; `nil` when the server refuses. Cached per
   connection (240 entries); the cache is cleared on re-dial.
@@ -77,13 +80,55 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   keyset cursor, sleeping `poll` seconds when caught up. `after:` is the last
   `"id"` (an opaque String) already handled.
 
+### Transactions
+
+`transaction(attempts: 3, begin: "BEGIN") { |conn| … } → the block's value`
+runs the block inside a transaction on this connection: it sends `begin`,
+yields the connection, then sends `COMMIT`.
+
+- `begin:` is the opening statement, sent as given: `"BEGIN"` on a standalone
+  server, `"BEGIN ATOMIC"` or `"BEGIN ATOMIC PARTITION (col = lit)"` on a
+  cluster.
+- A `COMMIT` refused with `TransactionConflict` (a standalone server ≥ 0.346:
+  another writer changed a row the transaction writes after its `BEGIN`;
+  nothing was applied) runs the whole transaction again from `begin`, up to
+  `attempts` runs in all with no pause between them. The block may therefore
+  run more than once: it must be safe to repeat and should do nothing outside
+  the database that a repeat would do twice. The conflict of the last
+  attempt is raised.
+- `begin` refused: its error is raised, the block never runs and nothing
+  else is sent.
+- The block does not run to its end (an exception of any class, `break`,
+  `throw`, a `return` out of it): `ROLLBACK` is sent and the exception
+  propagates unchanged, whatever the `ROLLBACK` itself answers — an error
+  from it is ignored. Nothing is retried, a `TransactionConflict` raised
+  inside the block included.
+- Any other `COMMIT` error is raised as it is, with no retry and no
+  `ROLLBACK` (a `COMMIT` that fails has ended the transaction).
+- A transport failure is the usual `ConnectionError` and is not retried.
+  Until `transaction` returns the connection does not re-dial: no `ROLLBACK`
+  is sent, and a statement the block runs after rescuing the failure raises
+  `ConnectionError` (`connection lost inside a transaction; …`). A
+  `ConnectionError` from the `COMMIT` leaves its outcome unknown.
+- A block cut short in the middle of a round trip (an `Interrupt`, a
+  `Timeout`, `Thread#kill`) leaves a reply on its way, so the connection is
+  not `usable?` and nothing more is written to it: no `ROLLBACK`. The
+  transaction ends with that socket, which the next statement after
+  `transaction` replaces.
+- Raises `ArgumentError`, before anything is sent, when `attempts` is not an
+  Integer ≥ 1 or no block is given.
+
+The whole transaction runs on this one connection, so no other thread may
+use it meanwhile.
+
 ### State
 
 - `consistency` / `consistency=` — the default level (`0`/`1`/`2`; the setter
   accepts anything `Consistency.resolve` does).
-- `usable?` — `false` once closed, once a transport error broke the socket,
-  or while a stream is in flight (including one abandoned through external
-  iteration). No round-trip.
+- `usable?` — `false` once closed, once a transport error broke the socket
+  or a round trip was cut short with its reply outstanding, or while a
+  stream is in flight (including one abandoned through external iteration).
+  No round-trip.
 - `endpoint` — the member the connection reached, as the `"host:port"` it
   dialed (it changes when a re-dial lands on another member).
 - `closed`, `finished?` — `true` after `close`.
@@ -93,12 +138,17 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
 ### Reconnect
 
 A transport failure raises `Skaidb::ConnectionError` and marks the
-connection broken. The next `exec`/`exec_params`/`exec_batch`/`stream`
+connection broken. A statement cut short between its request and its reply
+by anything else (an `Interrupt`, `Timeout.timeout`, `Thread#kill`) marks it
+broken too, since that reply is still on its way; the exception propagates
+as it is. The next `exec`/`exec_params`/`exec_batch`/`stream`
 re-dials across the original seeds (a pooled connection: in the pool's
 order, usable members first and the one it lost last), re-authenticates,
 re-sends `Hello`, re-runs `USE`, and starts with an empty prepared-statement
 cache. If the re-dial fails, that statement raises `ConnectionError` and the
-one after it tries again.
+one after it tries again. Inside `transaction` there is no re-dial: the
+transaction ended with its socket, so every further statement raises
+`ConnectionError` until the helper returns.
 
 ## `Skaidb::Result`
 
@@ -131,6 +181,10 @@ A thread-safe pool balanced across the cluster's members — see
 
 - `with(affinity: nil) { |conn| … }` — check out, yield, check in; returns
   the block's value.
+- `transaction(attempts: 3, begin: "BEGIN", affinity: nil) { |conn| … }` —
+  `Connection#transaction` on one checked-out connection, held for every
+  attempt and checked in afterwards; returns the block's value. The
+  arguments are checked before a connection is checked out.
 - `checkout(affinity: nil) → Connection` — an idle connection to the member
   the policy picks, or a new one. Never blocks. `affinity` (any Hash key;
   `nil` = pool-wide) scopes `read_your_writes`.
@@ -143,9 +197,9 @@ A thread-safe pool balanced across the cluster's members — see
 
 `load_balancing` (`:random`, `:round_robin`, `:least_latency`) and
 `idle_order` (`:lifo`, `:fifo`) take a Symbol or a String. Raises
-`ArgumentError` for `maxsize < 1`, `eject_errors < 1` or an unknown
-`load_balancing`/`idle_order`, and `Skaidb::Error` on checkout from a closed
-pool.
+`ArgumentError` for `maxsize < 1`, `eject_errors < 1`, an unknown
+`load_balancing`/`idle_order` or a `transaction` with `attempts` below 1 or
+no block, and `Skaidb::Error` on checkout from a closed pool.
 
 ## `Skaidb::Uuid`
 
@@ -173,6 +227,14 @@ otherwise.
   message is the server's), or a parameter could not be bound
   (placeholder/parameter mismatch, out-of-range Integer, non-finite Float or
   BigDecimal, unsupported type). The connection stays usable.
+- `Skaidb::TransactionConflict < QueryError` — the server refused a `COMMIT`
+  because another writer changed a row the transaction writes after its
+  `BEGIN` (a standalone server ≥ 0.346). Raised by every call that runs a
+  statement, for a server error whose message starts with
+  `Skaidb::TransactionConflict::PREFIX` (`"transaction conflict:"`); the
+  message is the server's. Nothing was applied, the transaction is over and
+  the connection stays usable, in autocommit; running the whole transaction
+  again from `BEGIN` is safe, which is what `transaction` does.
 
 ## Codec helpers
 
