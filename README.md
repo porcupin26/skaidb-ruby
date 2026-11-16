@@ -151,7 +151,7 @@ statements.
 
 A connection the server closed **while it sat idle** — a member restart, a
 failover, an idle timeout — costs no statement. Before a request is written
-the driver looks at the socket (one poll, no round trip): an idle connection
+the driver looks at the socket (one peek that does not wait, no round trip): an idle connection
 has nothing to read, so an end-of-file, a reset or stray bytes there mean it
 is gone, and the statement goes out on a new connection instead. A
 connection lost **under a statement** — the request was written and the

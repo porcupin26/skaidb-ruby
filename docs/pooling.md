@@ -181,7 +181,7 @@ the same in every skaidb driver
 - `checkout` and `checkin` both validate with `usable?`: a connection broken
   by a transport error, or left mid-stream by an abandoned Enumerator, is
   closed and dropped rather than handed on. `checkout` also looks at the
-  socket of the idle connection it is about to hand out (a poll, no round
+  socket of the idle connection it is about to hand out (a peek that does not wait, no round
   trip): one the server closed while it sat idle — a member restart, an
   idle timeout — is closed and the checkout takes the next idle connection
   or dials, so a restart costs the borrowers nothing. A connection lost

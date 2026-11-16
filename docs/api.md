@@ -216,7 +216,7 @@ the server drops the session — and a transaction left open on it — without
 waiting for the connection's next statement or its `close`.
 
 **A connection lost while idle.** Before each request is written the
-connection is looked at (a poll of the TCP socket and at most one peek,
+connection is looked at (one peek at the TCP socket that does not wait,
 never a round trip): an idle connection has nothing to read, so an
 end-of-file, a reset or bytes nobody asked for mean the server closed it
 while it sat idle. It is then marked broken like any other lost connection

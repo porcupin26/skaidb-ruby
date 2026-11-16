@@ -1545,8 +1545,8 @@ module Skaidb
     end
 
     # Whether this connection was lost while it sat idle: the peer has closed
-    # it, reset it, or written to it unasked. One poll of the socket and at
-    # most one peek at it, neither of which waits — no round trip.
+    # it, reset it, or written to it unasked. One peek at the socket, which
+    # does not wait — no round trip.
     #
     # A server closes its idle connections when it restarts, fails over or
     # times them out. The next request then finds a dead socket — and over a
@@ -1634,10 +1634,17 @@ module Skaidb
       nil
     end
 
-    # The poll and the peek of lost_while_idle? (the caller holds @mutex):
-    # whether the socket has anything to read. Readable and nothing there
-    # after all is a socket that is alive; an error from either call is one
-    # that is not.
+    # The look of lost_while_idle? (the caller holds @mutex): whether the
+    # socket has anything to read, asked with one peek that does not wait.
+    # Nothing there is a socket that is alive; end-of-file or data is one
+    # that is not, and so is an error from the call (a reset; bytes Ruby
+    # had already read ahead of a reply).
+    #
+    # The peek is not preceded by IO.select with a zero timeout: when the
+    # calling thread has an interrupt pending — another thread waiting for
+    # the interpreter lock is enough — Ruby returns from that select
+    # without having polled, and a socket at end-of-file is reported as
+    # having nothing to read (seen on Ruby 3.2, in the test suite).
     #
     # Under TLS there is one more place for bytes nobody asked for: sent in
     # the same TLS record as a reply, they were decrypted with it and wait
@@ -1647,9 +1654,7 @@ module Skaidb
     # well.
     def peer_gone?
       io = @sock.to_io # under TLS, the TCP socket beneath it
-      if IO.select([io], nil, nil, 0)
-        return io.recv_nonblock(1, Socket::MSG_PEEK, exception: false) != :wait_readable
-      end
+      return true unless io.recv_nonblock(1, Socket::MSG_PEEK, exception: false) == :wait_readable
       return false if io.equal?(@sock)
 
       !%i[wait_readable wait_writable].include?(@sock.read_nonblock(1, exception: false))
