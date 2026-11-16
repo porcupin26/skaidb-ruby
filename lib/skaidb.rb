@@ -1698,8 +1698,9 @@ module Skaidb
         nil
       end
       @sock = nil
-      # Cleared BEFORE dialling: dial! issues USE, which runs a statement and
-      # would otherwise re-enter this method forever.
+      # Cleared before dialling: it was said of the socket that is gone.
+      # (An endpoint that fails its handshake sets it again; the one that
+      # answers clears it, see dial!.)
       @broken = false
       dialled = false
       begin
