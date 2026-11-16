@@ -1559,10 +1559,12 @@ module Skaidb
     #
     # Under TLS the TCP socket is what is looked at, not the decrypted
     # stream: a peer that is gone ends the TCP connection whether or not it
-    # said a TLS goodbye first. A connection with a stream in flight is not
-    # idle — the frames on its socket are that stream's — and is not looked
-    # at; nor is one in the middle of another thread's round trip, which the
-    # look waits out (it takes the connection's lock).
+    # said a TLS goodbye first. (What the TLS layer has already decrypted
+    # and nobody asked for counts as stray bytes too; see peer_gone?.) A
+    # connection with a stream in flight is not idle — the frames on its
+    # socket are that stream's — and is not looked at; nor is one in the
+    # middle of another thread's round trip, which the look waits out (it
+    # takes the connection's lock).
     #
     # Internal: ensure_live! asks before every statement, and Pool before it
     # hands an idle connection out.
@@ -1636,11 +1638,21 @@ module Skaidb
     # whether the socket has anything to read. Readable and nothing there
     # after all is a socket that is alive; an error from either call is one
     # that is not.
+    #
+    # Under TLS there is one more place for bytes nobody asked for: sent in
+    # the same TLS record as a reply, they were decrypted with it and wait
+    # in the TLS layer's buffer, where the TCP socket shows nothing. So
+    # when the TCP socket is quiet the TLS layer is asked too, without
+    # waiting: data or end-of-file there is a connection that is gone as
+    # well.
     def peer_gone?
       io = @sock.to_io # under TLS, the TCP socket beneath it
-      return false unless IO.select([io], nil, nil, 0)
+      if IO.select([io], nil, nil, 0)
+        return io.recv_nonblock(1, Socket::MSG_PEEK, exception: false) != :wait_readable
+      end
+      return false if io.equal?(@sock)
 
-      io.recv_nonblock(1, Socket::MSG_PEEK, exception: false) != :wait_readable
+      !%i[wait_readable wait_writable].include?(@sock.read_nonblock(1, exception: false))
     rescue StandardError
       true
     end

@@ -316,6 +316,33 @@ class IdleLossTest < Minitest::Test
     end
   end
 
+  def test_under_tls_stray_bytes_retire_the_connection_wherever_they_are
+    arrivals = {
+      # a TLS record of its own: still on the TCP socket when the look comes
+      "in a record of their own" => ->(sock, reply, stray) { sock.write(reply) && sock.write(stray) },
+      # the same record as the reply: decrypted with it, and waiting in the
+      # TLS layer's buffer, where the TCP socket shows nothing
+      "in the reply's record" => ->(sock, reply, stray) { sock.write(reply + stray) }
+    }
+    arrivals.each do |where, write|
+      with_tls_server do |srv, ca_file|
+        srv.handler = handler(
+          "SELECT chatty" => lambda do |_req, conn|
+            write.call(conn[:sock], FakeSkaidb.frame(F.rows(["c"], [[7]])), FakeSkaidb.frame(F.rows(["c"], [[8]])))
+            []
+          end
+        )
+        c = connect(srv, tls_ca: ca_file)
+        assert_equal 7, c.exec("SELECT chatty")[0]["c"], where
+        sleep 0.1 # the frame nobody asked for has arrived
+        # the next statement does not take it for its reply
+        assert_equal 1, c.exec(ONE)[0]["c"], where
+        assert_equal 2, srv.connections, where
+        c.close
+      end
+    end
+  end
+
   def test_under_tls_a_connection_that_is_alive_is_not_dialled_again
     with_tls_server do |srv, ca_file|
       srv.handler = handler
