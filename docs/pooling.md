@@ -56,7 +56,14 @@ pool.close
 (`database`, TLS, `consistency`, `timeout`) apply to every connection, so
 pooled connections run `USE` and authenticate exactly like single ones. A
 pooled connection that re-dials after a transport error does so in the
-pool's order: usable members first, the one it lost last.
+pool's order: usable members first, the one it lost last. A borrower that
+sends its own `USE` moves that connection only while it holds it: a pool
+with `database:` puts an idle connection back in that database before it
+hands it out again (one extra round trip, only when it was moved; a
+connection that cannot be put back is dropped). A pool without `database:`
+has no database to put it back in, so there a borrower's `USE` stays with
+the connection — send `USE` after every checkout if borrowers use different
+databases.
 `Connection#endpoint` names the member a connection reached.
 
 ## Balancing across members

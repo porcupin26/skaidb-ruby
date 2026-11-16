@@ -758,6 +758,11 @@ module Skaidb
       @in_transaction = false
       @prepared = {}
       @last_prepare_error = nil
+      # The session database, as the USE target every dial re-enters: the one
+      # the connection was opened in (+database:+), and the one it is in now
+      # — a USE statement the server accepted moves it (see note_use).
+      @dial_use = database.to_s.empty? ? nil : %("#{database.to_s.gsub('"', '""')}")
+      @session_use = @dial_use
       # Retained so a reconnect repeats the original connect exactly.
       @dial_args = { host: host, port: port, user: user, password: password,
                      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
@@ -776,7 +781,6 @@ module Skaidb
       user = @dial_args[:user]
       password = @dial_args[:password]
       timeout = @dial_args[:timeout]
-      database = @dial_args[:database]
       tls = @dial_args[:tls]
       tls_ca = @dial_args[:tls_ca]
       tls_insecure = @dial_args[:tls_insecure]
@@ -833,8 +837,11 @@ module Skaidb
               "no reachable endpoint in #{endpoints.map { |(h, q)| "#{h}:#{q}" }.join(', ')}: #{last.message}"
       end
       send_hello
-      # USE is per-connection session state, so it runs on every dial.
-      exec(%(USE "#{database.to_s.gsub('"', '""')}")) if database && !database.to_s.empty?
+      # The database is per-connection session state, so it is entered on
+      # every dial — the one the session was last in, before anything else
+      # is sent. If the server refuses, the dial has failed and its error is
+      # the statement's: nothing runs in another database.
+      exec("USE #{@session_use}") if @session_use
     end
 
     # Best-effort self-identification: fills the server's +drivers+ table
@@ -1157,6 +1164,7 @@ module Skaidb
         when 1
           return Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation) # not row-producing
         when 2
+          note_use(sql.to_s) if params.empty?
           return Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
         when 8
           # ResultSets: a CALL whose body EMITted is answered with every set
@@ -1352,6 +1360,13 @@ module Skaidb
 
     def finished?
       @closed
+    end
+
+    # Internal, for Pool: put the session back in the database the connection
+    # was opened in (+database:+) when a USE statement has moved it since.
+    # One round trip, and none when there is nothing to put back.
+    def reenter_dial_database
+      exec("USE #{@dial_use}") if @dial_use && @session_use != @dial_use
     end
 
     private
@@ -1597,7 +1612,26 @@ module Skaidb
       reader = request(req)
       res = parse_response(reader)
       note_statement(sql)
+      note_use(sql)
       res
+    end
+
+    # +USE [DATABASE] <name>+ with an optional +;+ — the name bare, or in
+    # double quotes with "" for a quote inside.
+    USE_STATEMENT = /\A\s*USE\s+(?:DATABASE\s+)?("(?:[^"]|"")+"|[[:alpha:]_][[:alnum:]_]*)\s*;?\s*\z/i.freeze
+    private_constant :USE_STATEMENT
+
+    # A statement the server answered with success: when it is a USE, the
+    # session is in that database now, and a re-dial must put it back there
+    # (a new session starts in the default database, where a table of the
+    # same name is another table). The name is kept as it was written and
+    # sent again the same way. Text that is not exactly one such statement
+    # is left alone.
+    def note_use(sql)
+      m = USE_STATEMENT.match(sql)
+      @session_use = m[1] if m
+    rescue ArgumentError, EncodingError
+      nil # bytes the pattern cannot read
     end
 
     # The request +stream+ sends. Without parameters: OP_QUERY_STREAM with
@@ -1968,6 +2002,9 @@ module Skaidb
           # fine locally, so check before handing it out.
           close_quietly(conn)
           next
+        elsif !in_pool_database?(conn)
+          close_quietly(conn)
+          next
         end
         @mutex.synchronize do
           m = @members[conn.pool_member]
@@ -2163,6 +2200,17 @@ module Skaidb
       conn.close
     rescue StandardError
       nil
+    end
+
+    # An idle connection its last borrower moved with a USE statement goes
+    # back to the pool's +database:+ before it is handed out again; false
+    # when that fails (the connection is then dropped). A pool without
+    # +database:+ has no database to put it back in.
+    def in_pool_database?(conn)
+      conn.reenter_dial_database
+      true
+    rescue Error
+      false
     end
 
     def log(message)

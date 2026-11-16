@@ -146,10 +146,15 @@ conn = Skaidb.connect(seeds: ["db1", "db2:7000", "db3"], database: "app")
 Each seed is `"host"` or `"host:port"` (the port after the last colon wins; a
 seed without a port uses `port:`). When a connection's transport dies, the
 **next statement re-dials** across the same seeds, re-authenticates, re-sends
-`Hello`, re-runs `USE`, and drops the connection's prepared statements — a
-recovered connection is indistinguishable from a fresh one. The statement that
-discovered the loss raises `Skaidb::ConnectionError`; the one after it goes
-through.
+`Hello`, re-enters the session's database, and drops the connection's prepared
+statements. The statement that discovered the loss raises
+`Skaidb::ConnectionError`; the one after it goes through.
+
+The database re-entered is the one the session was last in: `database:`, or
+the one a later `USE <name>` statement sent with `exec` moved it to. It is
+entered before anything else is sent on the new socket, and if the server
+refuses it the statement raises that error instead of running in another
+database.
 
 ### Timeout
 

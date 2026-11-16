@@ -12,7 +12,7 @@ Everything lives under the `Skaidb` module in `lib/skaidb.rb`.
 | `password` | `""` | SCRAM password. Empty skips server-signature verification (anonymous connect). |
 | `consistency` | `:quorum` | Default level for every statement: `:one`, `:quorum`, `:all`, `"ONE"`…, or `0`/`1`/`2`. |
 | `timeout` | `10.0` | TCP connect timeout in seconds; `nil` for none. Reads are not bounded. |
-| `database` | `nil` | Runs `USE "<database>"` after the handshake (and after every re-dial). |
+| `database` | `nil` | Runs `USE "<database>"` after the handshake. Every re-dial re-enters the session's database: this one, or the one a later `USE` statement moved the session to. |
 | `seeds` | `nil` | `["host", "host:port", …]`, tried in random order until one connects **and** authenticates. |
 | `tls` | `false` | Enable TLS with the system trust store. |
 | `tls_ca` | `nil` | PEM file to trust instead of the system store; implies `tls`. |
@@ -160,8 +160,15 @@ waiting for the connection's next statement or its `close`. The next
 `exec`/`exec_params`/`exec_batch`/`stream`
 re-dials across the original seeds (a pooled connection: in the pool's
 order, usable members first and the one it lost last), re-authenticates,
-re-sends `Hello`, re-runs `USE`, and starts with an empty prepared-statement
-cache. If the re-dial fails, that statement raises `ConnectionError` and the
+re-sends `Hello`, re-enters the session's database, and starts with an empty
+prepared-statement cache. The database is the one the session was last in:
+`database:`, or the name of the last `USE [DATABASE] <name>` statement the
+server accepted from `exec`, `query`, `exec_params` or `stream` (the name
+bare or double-quoted, an optional trailing `;`; kept and sent again as it
+was written). It is entered before anything else is sent, and a refusal is
+raised to the statement that caused the re-dial — which is not sent — so no
+statement runs in another database. If the re-dial fails, that statement
+raises `ConnectionError` and the
 one after it tries again. Inside `transaction` there is no re-dial: the
 transaction ended with its socket, so every further statement raises
 `ConnectionError` until the helper returns.
