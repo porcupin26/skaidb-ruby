@@ -94,7 +94,7 @@ Draining is not free and there is no cancel opcode: breaking out of a
 million-row scan still transfers the rest of it before the connection is
 usable again. If you only want a few rows, say so in SQL (`LIMIT`).
 
-Two things defeat the drain:
+Three things defeat the drain:
 
 - **External iteration** — `e = conn.stream(sql); e.next` — runs the stream
   inside the Enumerator's Fiber. A Fiber abandoned part-way is collected
@@ -105,6 +105,14 @@ Two things defeat the drain:
   no longer knows where the reply ends, so it marks the connection broken
   and closes the socket instead of guessing; `usable?` turns `false`, and
   the next statement re-dials.
+- **A stream cut short while it waits for a frame** — `Timeout.timeout`
+  around the stream, an `Interrupt`, `Thread#kill`. Part of that frame may
+  already be read, and a drain would hold the exception back until the
+  server had sent the rest of the result, so there is none: the connection
+  is marked broken, its socket closed, and the exception propagates at
+  once. (The same exception arriving while your block runs finds the socket
+  at a frame boundary, and the stream is drained as for any other way of
+  leaving the block.)
 
 There is no read deadline: a peer that is alive but silent blocks the drain,
 holding the lock. `close` does not take the lock, so another thread can break

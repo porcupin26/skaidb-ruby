@@ -324,8 +324,9 @@ form — drains the frames the server is still sending so the socket sits at a
 request boundary again. Draining transfers the rest of the result: if you only
 want the first rows, say so with `LIMIT`. External iteration (`next`/`peek`)
 on the Enumerator form cannot unwind and leaves the connection marked busy;
-iterate with a block or `each`. A frame that makes no sense mid-stream, or a
-dead socket, marks the connection broken instead; `usable?` turns `false`
+iterate with a block or `each`. A frame that makes no sense mid-stream, a
+dead socket, or a stream cut short while it waits for a frame (a `Timeout`,
+an `Interrupt`) marks the connection broken instead; `usable?` turns `false`
 and the next statement re-dials. Details: [docs/streaming.md](https://github.com/porcupin26/skaidb-ruby/blob/main/docs/streaming.md).
 
 ## Connection pool

@@ -1063,7 +1063,10 @@ module Skaidb
     # sending so the connection sits at a request boundary again. When it
     # cannot (dead socket, a frame that makes no sense mid-stream) the
     # connection is marked broken instead, so +usable?+ turns false and Pool
-    # drops it rather than handing out a desynced socket.
+    # drops it rather than handing out a desynced socket. So it is when the
+    # stream is cut short while it waits for a frame (Timeout.timeout, an
+    # Interrupt, Thread#kill): nothing is drained, and the exception
+    # propagates at once.
     #
     # Draining is not free and there is no cancel opcode: breaking out of a
     # million-row scan still transfers the rest of it before the connection
@@ -1151,9 +1154,13 @@ module Skaidb
           @streaming = true
           cols = Array.new(r.u32) { r.text }
           summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
+          reading = false
           begin
             while live
-              fr = Reader.new(read_frame)
+              reading = true
+              frame = read_frame
+              reading = false
+              fr = Reader.new(frame)
               case fr.u8
               when 6
                 fr.u32.times do
@@ -1176,7 +1183,17 @@ module Skaidb
               end
             end
           ensure
-            drain_stream! if live
+            if reading
+              # Left while a frame was being read — the transport failed, or
+              # a Timeout, an Interrupt or Thread#kill cut the read short. The
+              # socket is not at a frame boundary (part of that frame may be
+              # consumed), so there is nothing to drain from; and draining
+              # would hold back the exception until the server had sent the
+              # rest of the stream, which a stalled server never does.
+              mark_broken!
+            elsif live
+              drain_stream!
+            end
             # Cleared last: until this point the connection is mid-reply, and a
             # caller who never unwinds here (an abandoned Enumerator Fiber)
             # leaves it set, so usable? keeps reporting the truth.

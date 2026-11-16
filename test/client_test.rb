@@ -425,6 +425,86 @@ class ClientTest < Minitest::Test
     end
   end
 
+  # A stream whose server sends the header, one chunk and the first +part+
+  # bytes of the next frame, then nothing until the gate opens.
+  def stalled_stream(gate, part)
+    second = FakeSkaidb.frame(F.chunk([[2]]))
+    lambda do |_req, conn|
+      conn[:sock].write(FakeSkaidb.frame(F.header(["id"])) + FakeSkaidb.frame(F.chunk([[1]])) + second[0, part])
+      gate.pop
+      conn[:sock].write(second[part..] + FakeSkaidb.frame(F.rows_end))
+      []
+    end
+  end
+
+  def test_a_stream_cut_short_while_it_reads_a_frame_retires_the_socket_instead_of_draining_it
+    interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with
+    stalls = { "between two frames" => 0, "in the middle of a frame" => 6 }
+    cuts = {
+      "an exception raised into the thread" => ->(thread) { thread.raise(interrupt) },
+      "Thread#kill" => ->(thread) { thread.kill }
+    }
+    stalls.to_a.product(cuts.to_a).each do |(stall_name, part), (cut_name, cut)|
+      what = "stalled #{stall_name}, cut short by #{cut_name}"
+      with_server do |srv|
+        gate = Queue.new
+        srv.handler = FakeSkaidb.scripted("SELECT slow" => stalled_stream(gate, part),
+                                          "SELECT 1" => F.rows(["c"], [[1]]))
+        c = connect(srv)
+        seen = Queue.new
+        worker = Thread.new do
+          Thread.current.report_on_exception = false
+          c.stream("SELECT slow") { |row| seen << row["id"] }
+        end
+        begin
+          assert_equal 1, seen.pop
+          until_true { worker.status == "sleep" } # back in the stream, waiting for the next frame
+          cut.call(worker)
+          # the exception is not held back until the server has sent the rest
+          # (and what is left of a frame read half-way is not a frame to drain)
+          begin
+            worker.join(2) || flunk("#{what}: the stream went on reading")
+          rescue interrupt
+            nil
+          end
+          refute c.usable?, what
+        ensure
+          gate << true # the server goes on: the rest of the stream finds the socket closed
+        end
+        assert_hung_up srv, 1, what
+        assert_equal 1, srv.connections, what
+        # the next statement reads its own reply, on a new socket
+        assert_equal 1, c.exec("SELECT 1")[0]["c"], what
+        assert_equal 2, srv.connections, what
+        c.close
+      end
+    end
+  end
+
+  def test_a_stream_that_times_out_waiting_for_a_frame_raises_at_the_timeout
+    with_server do |srv|
+      gate = Queue.new
+      srv.handler = FakeSkaidb.scripted("SELECT slow" => stalled_stream(gate, 0), "SELECT 1" => F.rows(["c"], [[1]]))
+      c = connect(srv)
+      seen = []
+      # the server goes on after 3 s, so a stream that waits for the rest of
+      # the reply instead of raising is a failure here, not a hang
+      late = Thread.new { sleep(3) && gate << true }
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      assert_raises(Timeout::Error) { Timeout.timeout(0.2) { c.stream("SELECT slow") { |row| seen << row["id"] } } }
+      assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 1.5
+      assert_equal [1], seen
+      refute c.usable?
+      late.kill
+      gate << true # the server goes on: the rest of the stream finds the socket closed
+      assert_hung_up srv, 1
+      assert_equal 1, srv.connections
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 2, srv.connections
+      c.close
+    end
+  end
+
   def test_a_cached_parameterised_statement_re_dials_a_lost_connection_too
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted(
