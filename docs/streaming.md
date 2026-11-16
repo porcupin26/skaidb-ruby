@@ -100,10 +100,12 @@ Three things defeat the drain:
   inside the Enumerator's Fiber. A Fiber abandoned part-way is collected
   without running any `ensure`, so nothing drains and the connection stays
   marked mid-stream: `usable?` is `false` for good and a pool will not hand
-  it out again. Iterate with a block or `each`. Nor is such an Enumerator
-  safe to simply drop: its Fiber owns the connection's lock, and Ruby 3.3
-  can crash (at a later garbage collection, or at exit) when an Enumerator
-  is collected in that state — read it to its end instead. Inside
+  it out again. Iterate with a block or `each`. Dropping such an Enumerator
+  costs the connection, not the process: its Fiber is collected while it
+  owns the connection's lock, and Ruby 3.3 crashes when a lock is freed
+  after the Fiber that owns it, so the driver keeps the lock of every
+  stream in flight alive until the stream ends — for a stream abandoned
+  this way, one small object for the life of the process. Inside
   [`transaction`](api.md#transactions) a stream left that way when the block
   ends costs the session: neither `COMMIT` nor `ROLLBACK` can be sent past
   it, and the transaction must not stay open on a live session, so the

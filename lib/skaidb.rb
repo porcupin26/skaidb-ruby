@@ -708,6 +708,31 @@ module Skaidb
     @nonce_mutex.synchronize { @nonce_counter += 1 }
   end
 
+  @stream_locks = {}.compare_by_identity
+
+  # Internal: the locks of the connections that have a stream in flight,
+  # held here from the stream's first row frame to its end.
+  #
+  # A stream read by external iteration (e = conn.stream(sql); e.next) runs
+  # in the Enumerator's Fiber, inside the connection's lock. Dropped
+  # half-read, that Fiber never runs again: it is collected still owning
+  # the lock. Ruby (3.3.8 measured) does not survive the lock then being
+  # freed AFTER the Fiber that owns it — a segfault or an abort at that
+  # collection or at exit, or a spin at exit. A lock that is referenced from
+  # here is not freed while the process runs, and at exit the interpreter
+  # releases a thread's locks before it frees anything. So the lock of an
+  # abandoned stream stays here for good: one small object per stream left
+  # that way, in exchange for the process.
+  def self.keep_stream_lock(lock)
+    @nonce_mutex.synchronize { @stream_locks[lock] = true }
+  end
+
+  # Internal: the stream ended (its ensure ran): its lock is the
+  # connection's own again.
+  def self.release_stream_lock(lock)
+    @nonce_mutex.synchronize { @stream_locks.delete(lock) }
+  end
+
   @dial_counter = 0
 
   # Internal: a process-wide number for each socket a connection dials. It
@@ -1206,6 +1231,7 @@ module Skaidb
           live = true
           @streaming = true
           @stream_fiber = Fiber.current
+          Skaidb.keep_stream_lock(@mutex)
           cols = Array.new(r.u32) { r.text }
           summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
           reading = false
@@ -1259,6 +1285,7 @@ module Skaidb
               # statement re-dials is not in the middle of any stream.
               @streaming = false
               @stream_fiber = nil
+              Skaidb.release_stream_lock(@mutex)
             end
           end
         else
