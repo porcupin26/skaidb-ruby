@@ -481,6 +481,51 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_drain_cut_short_retires_the_socket_instead_of_leaving_the_stream_to_the_next_statement
+    interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with
+    cuts = {
+      "an exception raised into the thread" => ->(thread) { thread.raise(interrupt) },
+      "Thread#kill" => ->(thread) { thread.kill }
+    }
+    cuts.each do |cut_name, cut|
+      what = "the drain cut short by #{cut_name}"
+      with_server do |srv|
+        gate = Queue.new
+        srv.handler = FakeSkaidb.scripted(
+          "SELECT slow" => stalled_stream(gate, 0),
+          "SELECT 1" => F.rows(["c"], [[1]]), "SELECT 2" => F.rows(["c"], [[2]]), "SELECT 3" => F.rows(["c"], [[3]])
+        )
+        c = connect(srv)
+        left = Queue.new
+        worker = Thread.new do
+          Thread.current.report_on_exception = false
+          c.stream("SELECT slow") do |_row|
+            left << true
+            break # leaves the stream: what the server still sends is drained on the way out
+          end
+        end
+        begin
+          left.pop
+          until_true { worker.status == "sleep" } # the drain waits for the next frame
+          cut.call(worker)
+          begin
+            worker.join(2) || flunk("#{what}: the drain went on reading")
+          rescue interrupt
+            nil
+          end
+        ensure
+          gate << true # the server sends the rest of the stream
+        end
+        # each statement reads its own reply — not a chunk the drain left
+        # behind, and not the reply of the statement before it
+        assert_equal [1, 2, 3], (1..3).map { |n| c.exec("SELECT #{n}")[0]["c"] }, what
+        assert c.usable?, what
+        assert_equal 2, srv.connections, what
+        c.close
+      end
+    end
+  end
+
   def test_a_stream_that_times_out_waiting_for_a_frame_raises_at_the_timeout
     with_server do |srv|
       gate = Queue.new

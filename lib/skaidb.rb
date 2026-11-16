@@ -1183,21 +1183,28 @@ module Skaidb
               end
             end
           ensure
-            if reading
-              # Left while a frame was being read — the transport failed, or
-              # a Timeout, an Interrupt or Thread#kill cut the read short. The
-              # socket is not at a frame boundary (part of that frame may be
-              # consumed), so there is nothing to drain from; and draining
-              # would hold back the exception until the server had sent the
-              # rest of the stream, which a stalled server never does.
-              mark_broken!
-            elsif live
-              drain_stream!
+            begin
+              if reading
+                # Left while a frame was being read — the transport failed,
+                # or a Timeout, an Interrupt or Thread#kill cut the read
+                # short. The socket is not at a frame boundary (part of that
+                # frame may be consumed), so there is nothing to drain from;
+                # and draining would hold back the exception until the
+                # server had sent the rest of the stream, which a stalled
+                # server never does.
+                mark_broken!
+              elsif live
+                drain_stream!
+              end
+            ensure
+              # Cleared last: until this point the connection is mid-reply,
+              # and a caller who never unwinds here (an abandoned Enumerator
+              # Fiber) leaves it set, so usable? keeps reporting the truth.
+              # In an ensure of its own: a drain that is itself cut short
+              # has retired the socket, and the connection the next
+              # statement re-dials is not in the middle of any stream.
+              @streaming = false
             end
-            # Cleared last: until this point the connection is mid-reply, and a
-            # caller who never unwinds here (an abandoned Enumerator Fiber)
-            # leaves it set, so usable? keeps reporting the truth.
-            @streaming = false
           end
         else
           raise QueryError, "unexpected response tag #{tag} to stream request"
@@ -1387,38 +1394,43 @@ module Skaidb
     end
 
     # Read out the frames left over from a stream the caller walked away from,
-    # so the connection is positioned at a request boundary again. Deliberately
+    # so the connection is positioned at a request boundary again.
+    #
     # Runs from an ensure, where an exception would replace whatever the
     # caller's block was already unwinding with — so an ordinary failure
     # marks the connection broken rather than raising. usable? then fails
     # and ensure_live! re-dials before the next statement.
     #
-    # Not exception-PROOF, and the difference matters: the rescue below
-    # catches StandardError, so Interrupt, SignalException and
-    # NoMemoryError still escape. They also skip the `@streaming = false`
-    # in the caller's ensure, which leaves the connection permanently
-    # unusable — safe, but only because "unusable" is the failing
-    # direction. Rescuing Exception here would hide a Ctrl-C, which is a
-    # worse trade than retiring one connection.
+    # An Interrupt, a Timeout or Thread#kill is not an ordinary failure: the
+    # rescue below catches StandardError only, so those still leave through
+    # here (rescuing Exception would hide a Ctrl-C). They leave the rest of
+    # the stream on the socket, so the ensure marks the connection broken on
+    # EVERY exit that did not reach the end of the stream. Left unmarked,
+    # the next statements on the connection read the leftover chunks as
+    # their replies, and after those the replies of the statements before
+    # them.
     #
-    # There is also no read DEADLINE. A peer that is alive but silent
-    # blocks the drain forever, holding @mutex — the same as every other
-    # read in this driver, and `close` deliberately does not take @mutex
-    # so another thread can break it. A genuinely dead socket (EOF, RST)
-    # exits correctly.
+    # There is no read DEADLINE. A peer that is alive but silent blocks the
+    # drain forever, holding @mutex — the same as every other read in this
+    # driver, and `close` deliberately does not take @mutex so another
+    # thread can break it. A genuinely dead socket (EOF, RST) exits
+    # correctly.
     def drain_stream!
+      drained = false
       loop do
         tag = Reader.new(read_frame).u8
-        break if tag == 7 || tag == 3 # RowsEnd, or an Error that ended the stream
-        next if tag == 6              # RowsChunk: more to come
+        next if tag == 6 # RowsChunk: more to come
 
-        mark_broken!
+        # RowsEnd, or an Error that ended the stream: at a request boundary.
+        # Anything else: where the reply ends is no longer known.
+        drained = [7, 3].include?(tag)
         break
       end
     rescue StandardError
-      # An I/O failure already marked it in read_exact; mark it for the rest
-      # (a truncated frame, say) so the socket is never reused mid-reply.
-      mark_broken!
+      # An I/O failure, or a frame too short to carry a tag: not drained.
+      nil
+    ensure
+      mark_broken! unless drained
     end
 
     def read_exact(n)
