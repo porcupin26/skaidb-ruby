@@ -1709,16 +1709,22 @@ module Skaidb
     # +USE [DATABASE] <name>+ with an optional +;+ — the name bare, or in
     # double quotes with "" for a quote inside.
     USE_STATEMENT = /\A\s*USE\s+(?:DATABASE\s+)?("(?:[^"]|"")+"|[[:alpha:]_][[:alnum:]_]*)\s*;?\s*\z/i.freeze
-    private_constant :USE_STATEMENT
+    # A +--+ comment, which the server skips to the end of its line — or a
+    # double-quoted name or single-quoted string, inside which two dashes are
+    # not a comment (an unclosed quote runs to the end of the text).
+    COMMENT_OR_QUOTED = /"[^"]*(?:"|\z)|'[^']*(?:'|\z)|--[^\n]*/.freeze
+    private_constant :USE_STATEMENT, :COMMENT_OR_QUOTED
 
     # A statement the server answered with success: when it is a USE, the
     # session is in that database now, and a re-dial must put it back there
     # (a new session starts in the default database, where a table of the
-    # same name is another table). The name is kept as it was written and
-    # sent again the same way. Text that is not exactly one such statement
-    # is left alone.
+    # same name is another table). Comments are skipped as the server skips
+    # them (+USE app -- the app database+). The name is kept as it was
+    # written and sent again the same way, in a USE of its own. Text that is
+    # not exactly one such statement is left alone.
     def note_use(sql)
-      m = USE_STATEMENT.match(sql)
+      text = sql.gsub(COMMENT_OR_QUOTED) { |part| part.start_with?("--") ? "" : part }
+      m = USE_STATEMENT.match(text)
       @session_use = m[1] if m
     rescue ArgumentError, EncodingError
       nil # bytes the pattern cannot read

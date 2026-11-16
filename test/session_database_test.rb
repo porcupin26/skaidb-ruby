@@ -24,7 +24,7 @@ class SessionDatabaseTest < Minitest::Test
 
       a = answers[req.sql]
       a = a.call(req) if a.respond_to?(:call)
-      a || (req.sql =~ /\A\s*(--[^\n]*\n)?\s*USE\b/i ? F.ddl : F.error("fake server: unknown statement #{req.sql}"))
+      a || (req.sql =~ /\A\s*(--[^\n]*\n\s*)*USE\b/i ? F.ddl : F.error("fake server: unknown statement #{req.sql}"))
     end
   end
 
@@ -63,7 +63,16 @@ class SessionDatabaseTest < Minitest::Test
       %(USE "app") => %(USE "app"),
       %(USE DATABASE "we""ird name" ;) => %(USE "we""ird name"),
       "USE database" => "USE database", # a database called database
-      "USE café_2" => "USE café_2"
+      "USE café_2" => "USE café_2",
+      # the server skips -- comments, each to the end of its line; what is
+      # sent again on a re-dial is the USE alone
+      "USE app -- the app database" => "USE app",
+      "USE app; -- then the reports" => "USE app",
+      "USE app --" => "USE app",
+      "-- to the archive\nUSE archive" => "USE archive",
+      "USE DATABASE app -- one\n-- two\n;" => "USE app",
+      %(USE "a--b") => %(USE "a--b"), # dashes inside a quoted name are the name
+      %(USE "a--b" -- 'quoted' "words" in the comment) => %(USE "a--b")
     }
     senders = {
       "exec" => ->(c, sql) { c.exec(sql) },
@@ -105,12 +114,15 @@ class SessionDatabaseTest < Minitest::Test
       srv.handler = handler(
         "USE nope" => F.error("database nope does not exist"), # refused: nothing was entered
         "USERS" => F.ddl, "SELECT 'USE x'" => F.rows(["c"], [["USE x"]]),
-        "USE a; USE b" => F.ddl, "-- to the archive\nUSE archive" => F.ddl
+        "USE a; USE b" => F.ddl,
+        # a comment is not a statement, and what follows USE here is one
+        "-- USE archive" => F.ddl, "USE -- archive" => F.ddl, "SELECT '--' -- \nUSE archive" => F.ddl
       )
       c = connect(srv)
       c.exec("USE app")
       assert_raises(Skaidb::QueryError) { c.exec("USE nope") }
-      ["USERS", "SELECT 'USE x'", "USE a; USE b", "-- to the archive\nUSE archive"].each { |sql| c.exec(sql) }
+      ["USERS", "SELECT 'USE x'", "USE a; USE b", "-- USE archive", "USE -- archive",
+       "SELECT '--' -- \nUSE archive"].each { |sql| c.exec(sql) }
       _count, sent = lose_and_run(srv, c)
       assert_equal ["USE app", COUNT, INSERT], sent
       c.close

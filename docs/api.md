@@ -176,8 +176,9 @@ re-sends `Hello`, re-enters the session's database, and starts with an empty
 prepared-statement cache. The database is the one the session was last in:
 `database:`, or the name of the last `USE [DATABASE] <name>` statement the
 server accepted from `exec`, `query`, `exec_params` or `stream` (the name
-bare or double-quoted, an optional trailing `;`; kept and sent again as it
-was written). It is entered before anything else is sent, and a refusal is
+bare or double-quoted, an optional trailing `;`, `--` comments skipped as
+the server skips them; the name is kept as it was written and sent again
+in a `USE` of its own). It is entered before anything else is sent, and a refusal is
 raised to the statement that caused the re-dial — which is not sent — so no
 statement runs in another database. If the re-dial fails, that statement
 raises `ConnectionError` and the
