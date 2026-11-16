@@ -670,6 +670,163 @@ class TransactionTest < Minitest::Test
     end
   end
 
+  # ---- a stream the block leaves open --------------------------------------
+  #
+  # An Enumerator from +stream+ advanced with +next+ runs the stream in its
+  # own Fiber, which then sits in the middle of the reply until it is
+  # advanced again: nothing else can be sent on that socket meanwhile, a
+  # COMMIT or a ROLLBACK included.
+  #
+  # None of these tests leaves such a Fiber behind: an Enumerator dropped
+  # while its Fiber holds a lock crashes Ruby 3.3 when it is collected.
+
+  BIG = "SELECT id FROM big"
+
+  def big_script(overrides = {})
+    script({ BIG => [F.header(["id"]), F.chunk([[1], [2]]), F.chunk([[3]]), F.rows_end] }.merge(overrides))
+  end
+
+  def test_a_stream_the_block_leaves_open_cannot_leave_a_transaction_to_join
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(big_script)
+      c = connect(srv)
+      rows = nil
+      e = assert_raises(Skaidb::ConnectionError) do
+        c.transaction do |tx|
+          tx.exec(DEBIT)
+          rows = tx.stream(BIG)
+          assert_equal 1, rows.next["id"]
+          :returned
+        end
+      end
+      assert_match(/stream .*left open/, e.message)
+      # neither COMMIT nor ROLLBACK could be sent, so the socket was closed:
+      # the server drops the transaction with it
+      assert_hung_up srv, 1
+      assert_equal ["BEGIN", DEBIT, BIG], statements(srv)
+      assert_equal 1, srv.connections
+      # the stream was unwound with it: the connection is not left busy, it
+      # is what it is after any lost connection
+      refute c.usable?
+      refute c.finished?
+      # a later statement re-dials: a new session, with no transaction open
+      assert_equal 1, c.exec(CREDIT).cmd_tuples
+      assert_equal 2, srv.connections
+      assert c.usable?
+      # and the Enumerator, advanced again, starts its statement again there
+      # — it does not go on reading the reply of the session that is gone
+      assert_equal [1, 2, 3], Array.new(3) { rows.next["id"] }
+      assert_raises(StopIteration) { rows.next }
+      assert_equal [CREDIT, BIG], statements(srv).drop(3)
+      assert_equal 2, srv.connections
+      assert c.usable?
+      c.close
+    end
+  end
+
+  def test_a_block_that_raises_with_a_stream_open_keeps_its_error_and_loses_the_session
+    boom = RuntimeError.new("boom")
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(big_script)
+      c = connect(srv)
+      e = assert_raises(RuntimeError) do
+        c.transaction do |tx|
+          tx.exec(DEBIT)
+          tx.stream(BIG).next
+          raise boom
+        end
+      end
+      assert_same boom, e
+      assert_hung_up srv, 1
+      assert_equal ["BEGIN", DEBIT, BIG], statements(srv) # no ROLLBACK could be sent either
+      refute c.usable?
+      # the statement after it: on 1.5.0 the stream could be read to its end
+      # and this then ran inside the transaction nothing had rolled back
+      assert_equal 1, c.exec(CREDIT).cmd_tuples
+      assert_equal 2, srv.connections
+      # leaving with break is leaving: no error of the helper's, the same end
+      left = c.transaction do |tx|
+        tx.stream(BIG).next
+        break :left
+      end
+      assert_equal :left, left
+      assert_hung_up srv, 2
+      assert_equal ["BEGIN", BIG], statements(srv).drop(4)
+      refute c.usable?
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 3, srv.connections
+      c.close
+    end
+  end
+
+  def test_a_stream_left_open_in_a_fiber_the_helper_cannot_reach_closes_the_connection_for_good
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(big_script)
+      c = connect(srv)
+      e = assert_raises(Skaidb::ConnectionError) do
+        c.transaction do |tx|
+          # the stream is opened, and left, by another thread: its Fiber
+          # cannot be resumed from this one
+          Thread.new { tx.stream(BIG).next }.join
+          :returned
+        end
+      end
+      assert_match(/stream .*left open/, e.message)
+      assert_hung_up srv, 1
+      assert_equal ["BEGIN", BIG], statements(srv)
+      # no re-dial under a stream that may still read this connection
+      assert c.finished?
+      assert_raises(Skaidb::ConnectionError) { c.exec(CREDIT) }
+      assert_equal 1, srv.connections
+    end
+  end
+
+  def test_a_stream_the_block_finished_or_left_through_its_ensure_commits_as_always
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(big_script)
+      c = connect(srv)
+      value = c.transaction do |tx|
+        seen = []
+        tx.stream(BIG) { |row| seen << row["id"] }   # to its end
+        seen << tx.stream(BIG).first(1)[0]["id"]     # left early: drained on the way out
+        tx.stream(BIG) { |_row| break }
+        rows = tx.stream(BIG)                        # advanced by hand, to its end
+        seen << rows.next["id"]
+        loop { rows.next }
+        seen
+      end
+      assert_equal [1, 2, 3, 1, 1], value
+      assert_equal ["BEGIN", BIG, BIG, BIG, BIG, "COMMIT"], statements(srv)
+      assert c.usable?
+      assert_equal 1, srv.connections
+      c.close
+    end
+  end
+
+  def test_pool_transaction_does_not_take_back_a_connection_whose_block_left_a_stream_open
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(big_script)
+      pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret")
+      held = nil
+      e = assert_raises(Skaidb::ConnectionError) do
+        pool.transaction do |conn|
+          held = conn
+          conn.stream(BIG).next
+          :returned
+        end
+      end
+      assert_match(/stream .*left open/, e.message)
+      assert_hung_up srv, 1
+      assert held.finished?
+      assert_equal [0, 0], pool.members[0].values_at(:in_use, :idle)
+      # the next transaction gets a connection of its own, in autocommit
+      assert_equal :done, pool.transaction { |conn| conn.exec(DEBIT) && :done }
+      assert_equal ["BEGIN", BIG, "BEGIN", DEBIT, "COMMIT"], statements(srv)
+      assert_equal 2, srv.connections
+      pool.close
+    end
+  end
+
   # ---- a broken connection lets go of its socket ---------------------------
   #
   # The server keeps a session, the transaction open on it and the rows that

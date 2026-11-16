@@ -100,7 +100,11 @@ Three things defeat the drain:
   inside the Enumerator's Fiber. A Fiber abandoned part-way is collected
   without running any `ensure`, so nothing drains and the connection stays
   marked mid-stream: `usable?` is `false` for good and a pool will not hand
-  it out again. Iterate with a block or `each`.
+  it out again. Iterate with a block or `each`. Inside
+  [`transaction`](api.md#transactions) a stream left that way when the block
+  ends costs the session: neither `COMMIT` nor `ROLLBACK` can be sent past
+  it, and the transaction must not stay open on a live session, so the
+  socket is closed and the stream ended.
 - **A frame that makes no sense mid-stream**, or a dead socket. The driver
   no longer knows where the reply ends, so it marks the connection broken
   and closes the socket instead of guessing; `usable?` turns `false`, and

@@ -508,6 +508,15 @@ What else `transaction` does:
   still on its way, so nothing more is written to that socket. Either way
   the socket is closed at once, and the server drops the transaction with
   it.
+- A stream the block leaves open — an Enumerator from `stream` advanced with
+  `next` or `peek` and not read to its end — sits in the middle of its
+  reply, so neither `COMMIT` nor `ROLLBACK` can be sent. The socket is
+  closed instead, the server drops the transaction with it, and
+  `transaction` raises `ConnectionError` — unless the block was itself
+  leaving with an exception, `break` or `throw`, which carries on. The
+  stream is ended too, so the connection's next statement re-dials as after
+  any lost connection. Read a stream to its end, or give `stream` a block,
+  before the transaction's block returns.
 - `pool.transaction(attempts: 3, begin: "BEGIN", affinity: nil)` checks one
   connection out, runs every attempt on it, and returns it afterwards.
 

@@ -31,6 +31,11 @@ require "socket"
 require "openssl"
 require "securerandom"
 require "bigdecimal"
+begin
+  require "fiber" # Fiber.current, before Ruby 3.1 made it core
+rescue LoadError
+  nil
+end
 
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
@@ -743,8 +748,11 @@ module Skaidb
       # Transport died, and its socket is closed (see mark_broken!); the next
       # statement re-dials (see ensure_live!).
       @broken = false
-      # A stream is in flight, so the socket sits mid-reply (see stream).
+      # A stream is in flight, so the socket sits mid-reply (see stream), and
+      # the Fiber it runs in: the transaction helper unwinds a stream its
+      # block left open (see abandon_open_stream).
       @streaming = false
+      @stream_fiber = nil
       # The transaction helper is between its BEGIN and its COMMIT/ROLLBACK,
       # so a lost socket must not be re-dialled (see ensure_live!).
       @in_transaction = false
@@ -999,6 +1007,17 @@ module Skaidb
     #   Interrupt, a Timeout): the reply is still on its way, so nothing more
     #   is written to that socket. Either way the socket is closed at once,
     #   and the server drops the transaction with it.
+    # - A stream the block leaves open — an Enumerator from +stream+ advanced
+    #   with +next+ or +peek+ and not read to its end — sits in the middle of
+    #   its reply, so neither COMMIT nor ROLLBACK can be sent. The socket is
+    #   closed instead and the server drops the transaction with it:
+    #   ConnectionError is raised, unless the block was itself leaving with
+    #   an exception, +break+ or +throw+, which carries on. The stream is
+    #   ended with it, so the connection is what it is after any lost
+    #   connection (the next statement re-dials), and the Enumerator starts
+    #   its statement again if it is advanced again. Read a stream to its
+    #   end, or give +stream+ a block, before the transaction's block
+    #   returns.
     #
     # The whole transaction runs on this one connection, so no other thread
     # may use it meanwhile. +attempts+ below 1, or no block, is an
@@ -1019,7 +1038,12 @@ module Skaidb
           value = yield self
           finished = true
         ensure
+          abandoned = abandon_open_stream
           rollback_quietly unless finished
+        end
+        if abandoned
+          raise ConnectionError, "a stream opened inside the transaction was left open, so COMMIT could not " \
+                                 "be sent: its session was dropped and nothing was committed"
         end
         committing = true
         exec("COMMIT")
@@ -1152,6 +1176,7 @@ module Skaidb
           # two-line window.
           live = true
           @streaming = true
+          @stream_fiber = Fiber.current
           cols = Array.new(r.u32) { r.text }
           summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
           reading = false
@@ -1204,6 +1229,7 @@ module Skaidb
               # has retired the socket, and the connection the next
               # statement re-dials is not in the middle of any stream.
               @streaming = false
+              @stream_fiber = nil
             end
           end
         else
@@ -1512,6 +1538,48 @@ module Skaidb
       exec("ROLLBACK") if usable?
     rescue StandardError
       nil
+    end
+
+    # Internal: raised into the Fiber of a stream the transaction helper's
+    # block left open, to unwind it. Not a StandardError, so nothing between
+    # the stream and the top of that Fiber takes it for an ordinary failure.
+    class StreamAbandoned < Exception; end # rubocop:disable Lint/InheritException
+    private_constant :StreamAbandoned
+
+    # The transaction helper's check once its block is done: is a stream the
+    # block opened still in flight? That is an Enumerator from +stream+
+    # advanced with +next+ and not read to its end: its Fiber holds the
+    # socket in the middle of the reply (and the connection's lock), so
+    # neither COMMIT nor ROLLBACK can be sent, and the transaction would stay
+    # open on a live session — where a statement sent after the stream was
+    # read to its end would run inside it, uncommitted.
+    #
+    # So the session goes: the connection is marked broken, which closes the
+    # socket, and the server drops the transaction with it. Then the stream
+    # is unwound — an exception raised into its Fiber runs the stream's
+    # ensure, which finds nothing to drain, clears the busy flag and releases
+    # the lock — so the connection is what it is after any lost connection:
+    # the next statement re-dials. The Fiber must not be left where it is:
+    # it owns the lock, and an Enumerator dropped in that state takes the
+    # lock's owner with it when it is collected (which Ruby 3.3 does not
+    # survive).
+    #
+    # A stream whose Fiber cannot be reached (it runs in another thread)
+    # leaves the connection closed for good instead: a re-dial would hand
+    # that Fiber, when it is resumed, a new socket to read its old reply
+    # from. Returns whether a stream was in flight.
+    def abandon_open_stream
+      return false unless @streaming
+
+      fiber = @stream_fiber
+      mark_broken!
+      begin
+        fiber.raise(StreamAbandoned) if fiber&.alive? && !fiber.equal?(Fiber.current)
+      rescue StreamAbandoned, StandardError
+        nil # unwound; or not reachable (FiberError), which the next line sees
+      end
+      close if @streaming
+      true
     end
 
     def run(sql, consistency)

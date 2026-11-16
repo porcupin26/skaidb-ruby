@@ -116,6 +116,18 @@ yields the connection, then sends `COMMIT`.
   transaction ends with that socket, which is closed at once — the server
   drops the transaction with it — and which the next statement after
   `transaction` replaces.
+- A stream the block leaves open (an Enumerator from `stream` advanced with
+  `next`/`peek` and not read to its end) sits in the middle of its reply, so
+  neither `COMMIT` nor `ROLLBACK` can be sent. The connection is marked
+  broken — its socket closed, so the server drops the transaction — and the
+  stream is ended, which frees the connection: its next statement re-dials.
+  `transaction` raises `ConnectionError` (`a stream opened inside the
+  transaction was left open, …`) when the block ran to its end; a block
+  that was leaving with an exception, `break` or `throw` leaves with that.
+  The Enumerator, advanced again, starts its statement again on the
+  re-dialled connection, outside any transaction. (A stream opened by
+  another thread cannot be ended from here: the connection is closed for
+  good instead, `finished?` is `true`.)
 - Raises `ArgumentError`, before anything is sent, when `attempts` is not an
   Integer ≥ 1 or no block is given.
 
