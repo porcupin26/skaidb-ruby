@@ -691,11 +691,12 @@ fails when the vendored `vectors.json` differs from the published
 
 [`examples/`](https://github.com/porcupin26/skaidb-ruby/tree/main/examples)
 contains runnable scripts: `basic.rb`, `prepared_batch.rb`, `stream.rb`,
-`pool.rb`, `tls.rb`, `subscribe.rb`. Each takes
+`transaction.rb`, `pool.rb`, `tls.rb`, `subscribe.rb`. Each takes
 `host port user password` on the command line and defaults to
 `localhost:7000`; the arguments after those differ per script:
 
-- `basic.rb`, `prepared_batch.rb`, `stream.rb`, `pool.rb`: `[database]`
+- `basic.rb`, `prepared_batch.rb`, `stream.rb`, `transaction.rb`, `pool.rb`:
+  `[database]`
 - `subscribe.rb`: `[database] [stream]` (the stream defaults to
   `orders_stream`)
 - `tls.rb`: `[ca.crt]`, a CA file to trust; without it the script uses the
