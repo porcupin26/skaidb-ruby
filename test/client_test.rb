@@ -465,6 +465,40 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_connect_that_fails_after_the_handshake_closes_its_socket
+    interrupt = Class.new(Exception) # rubocop:disable Lint/InheritException
+    with_server do |srv|
+      gate = Queue.new
+      srv.handler = lambda do |req, _conn|
+        next gate.pop && F.ddl if req.op == 8 && srv.hellos.length == 2 # the second connection's Hello is sat on
+        next nil if req.op == 8
+
+        F.error(%(database "nope" does not exist))
+      end
+      # the handshake succeeded, so the server holds a session; the database
+      # is refused, so the caller gets an error and no connection to close
+      e = assert_raises(Skaidb::QueryError) { connect(srv, database: "nope") }
+      assert_equal %(database "nope" does not exist), e.message
+      assert_hung_up srv, 1 # at once, not when the collector comes to it
+      # the same for a connect cut short after its handshake
+      worker = Thread.new do
+        Thread.current.report_on_exception = false
+        connect(srv)
+      end
+      until_true { srv.hellos.length == 2 }
+      until_true { worker.status == "sleep" }
+      worker.raise(interrupt)
+      assert_raises(interrupt) { worker.join(2) || flunk("the connect went on waiting") }
+      gate << true
+      assert_hung_up srv, 2
+      # and a pool's checkout
+      pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret", database: "nope")
+      assert_raises(Skaidb::QueryError) { pool.checkout }
+      assert_hung_up srv, 3
+      pool.close
+    end
+  end
+
   def test_a_connect_that_reaches_no_endpoint_prints_no_warning
     dead = TCPServer.new("127.0.0.1", 0)
     dead_port = dead.addr[1]

@@ -833,7 +833,17 @@ module Skaidb
                      tls_insecure: tls_insecure, tls_server_name: tls_server_name,
                      seeds: seeds, tls_client_cert: tls_client_cert,
                      tls_client_key: tls_client_key, endpoints: endpoints }
-      dial!
+      # A first dial that does not finish — the database refused after the
+      # handshake, or the connect cut short — raises out of here, and the
+      # caller gets no connection to close. Its socket is closed now: left
+      # to the collector, the server would hold the session until then.
+      dialled = false
+      begin
+        dial!
+        dialled = true
+      ensure
+        mark_broken! unless dialled
+      end
     end
 
     # Connect, authenticate and restore the session. Used for the first
