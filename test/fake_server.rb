@@ -134,7 +134,7 @@ module FakeSkaidb
     ITERATIONS = 1000
 
     attr_reader :port, :requests, :hellos, :connections, :hangups
-    attr_accessor :corrupt_server_signature, :handler, :refuse
+    attr_accessor :corrupt_server_signature, :handler, :refuse, :on_auth_start
 
     # password: the one password every user has.
     # handler: ->(req, conn) { payload | [payloads] | :close | :half_close | nil }
@@ -145,6 +145,9 @@ module FakeSkaidb
     #   session and goes on reading, as a peer that only shut down its side.
     # refuse (attribute): while true, each new connection is closed before
     #   the handshake — a node that is down while its port still accepts.
+    # on_auth_start (attribute): called with the number of the connection
+    #   (1 for the first one accepted) when its AuthStart has arrived, before
+    #   the challenge is sent — a handshake a test can sit on.
     # hangups: the connections the CLIENT ended — it closed its socket while
     #   the server still held the session (and whatever was open on it).
     def initialize(password: "secret", &handler)
@@ -159,6 +162,7 @@ module FakeSkaidb
       @mutex = Mutex.new
       @corrupt_server_signature = false
       @refuse = false
+      @on_auth_start = nil
     end
 
     def start
@@ -175,11 +179,11 @@ module FakeSkaidb
             sock.close rescue nil
             next
           end
-          @mutex.synchronize do
-            @connections += 1
+          number = @mutex.synchronize do
             @sockets << sock
+            @connections += 1
           end
-          @threads << Thread.new(sock) { |s| serve(s) }
+          @threads << Thread.new(sock, number) { |s, n| serve(s, n) }
         end
       end
       self
@@ -216,8 +220,8 @@ module FakeSkaidb
       sock.write(FakeSkaidb.frame(payload))
     end
 
-    def serve(sock)
-      conn = { sock: sock, user: nil }
+    def serve(sock, number)
+      conn = { sock: sock, user: nil, number: number }
       return unless handshake(sock, conn)
 
       while (payload = read_frame(sock))
@@ -260,6 +264,7 @@ module FakeSkaidb
 
       user = r.text
       client_nonce = r.text
+      @on_auth_start&.call(conn[:number])
       salt = SecureRandom.random_bytes(16)
       server_nonce = "s#{SecureRandom.hex(6)}"
       conn[:user] = user

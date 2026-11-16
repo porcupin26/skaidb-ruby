@@ -606,6 +606,47 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_re_dial_cut_short_in_its_handshake_does_not_leave_a_half_made_connection_either
+    interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with: not a StandardError
+    cuts = {
+      "an exception raised into the thread" => ->(thread) { thread.raise(interrupt) },
+      "Thread#kill" => ->(thread) { thread.kill }
+    }
+    cuts.each do |cut_name, cut|
+      what = "the handshake cut short by #{cut_name}"
+      with_server do |srv|
+        gate = Queue.new
+        srv.handler = FakeSkaidb.scripted(ONE => ONE_ROW, "SELECT 2" => F.rows(["c"], [[2]]), "SELECT lost" => :close)
+        srv.on_auth_start = ->(number) { gate.pop if number == 2 } # the second connection's challenge is sat on
+        c = connect(srv)
+        assert_raises(Skaidb::ConnectionError) { c.exec("SELECT lost") } # the next statement re-dials
+        worker = Thread.new do
+          Thread.current.report_on_exception = false
+          c.exec(ONE) # re-dials: AuthStart is out, the challenge does not come
+        end
+        begin
+          until_true { srv.connections == 2 }
+          until_true { worker.status == "sleep" }
+          cut.call(worker)
+          begin
+            worker.join(2) || flunk("#{what}: the re-dial went on waiting")
+          rescue interrupt
+            nil
+          end
+          # a socket in the middle of its handshake is no connection
+          refute c.usable?, what
+        ensure
+          gate << true # the challenge now arrives on the half-made connection
+        end
+        # the next statement reads its own reply — not the challenge — on a third socket
+        assert_equal [[2]], c.exec("SELECT 2").rows, what
+        assert_equal 3, srv.connections, what
+        assert c.usable?, what
+        c.close
+      end
+    end
+  end
+
   def test_a_round_trip_cut_short_retires_the_socket_instead_of_leaving_its_reply_to_the_next_statement
     interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with: not a StandardError
     calls = {
