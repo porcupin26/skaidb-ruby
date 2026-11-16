@@ -54,9 +54,12 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   (which names the failing row index; earlier rows stay applied).
 - `exec_prepared(id, params, consistency) → Result` — run a statement by the
   id `prepare_server` returned, with an Array of typed values in `?` order.
-  The id is valid on the socket that prepared it: on a broken connection
-  this raises `ConnectionError` instead of re-dialing, and `prepare_server`
-  hands out a new id.
+  An id names its statement for as long as you hold it: it carries the
+  socket that issued it, and when the connection has re-dialled since, the
+  statement is prepared again on the new socket before it runs — an id is
+  never sent to a socket that did not issue it, where the same number could
+  name another statement. A broken connection re-dials here as for any
+  statement. An id another connection issued raises `QueryError`.
 - `prepare_server(sql) → [id, nparams] | nil` — prepare a statement with `?`
   placeholders on the server; `nil` when the server declines the statement
   kind, `QueryError` when its statement table is full. The id is yours to
@@ -65,8 +68,8 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   statements the driver prepares itself for `exec_params` and `exec_batch`
   are a cache of the least recently used, closed on the server (`OP_CLOSE`)
   as they leave it, so that held and cached statements together stay at 240
-  — under the server's 256 per connection. Everything is forgotten on
-  re-dial.
+  — under the server's 256 per connection. The server-side statements are
+  gone after a re-dial; the ids you hold stay valid (see `exec_prepared`).
 - `stream(sql, params = [], consistency: nil) { |row| … } → Result` — see
   [streaming.md](streaming.md). `params` (an Array) bind `$1`, `$2`, …
   exactly as `exec_params` binds them, typed, over `OP_QUERY_STREAM_PARAMS`

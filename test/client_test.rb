@@ -625,13 +625,15 @@ class ClientTest < Minitest::Test
       assert_raises(Skaidb::ConnectionError) { c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[3]]) }
       assert_equal 1, c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[3]])
       assert_equal 3, srv.connections
-      # an id handed out by prepare_server does not outlive its socket
+      # an id handed out by prepare_server is never sent down another socket:
+      # its statement is prepared again on the one that replaced it
       id, = c.prepare_server("SELECT ?")
       srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [1], 1) }
-      e = assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [1], 1) }
-      assert_equal "connection is broken; prepare the statement again", e.message
-      assert_equal 3, srv.connections
+      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [1], 1) } # meets the loss
+      prepares = srv.requests.count { |q| q.op == 2 }
+      assert_equal 1, c.exec_prepared(id, [1], 1)[0]["p"]
+      assert_equal prepares + 1, srv.requests.count { |q| q.op == 2 }
+      assert_equal 4, srv.connections
       c.close
     end
   end

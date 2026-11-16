@@ -170,4 +170,67 @@ class PreparedStatementsTest < Minitest::Test
       c.close
     end
   end
+
+  # ---- an id belongs to the connection that issued it ----------------------
+
+  A = "UPDATE t SET v = ? WHERE id = ?"
+  B = "DELETE FROM t WHERE v = ? AND id = ?" # the same parameter count, another effect
+
+  def test_after_a_re_dial_each_cached_statement_runs_as_itself
+    with_table do |srv, table|
+      c = connect(srv)
+      c.exec_params("UPDATE t SET v = $1 WHERE id = $2", [1, 1]) # A takes the first id
+      c.exec_params("DELETE FROM t WHERE v = $1 AND id = $2", [2, 2])
+      srv.close_all # lost while idle
+      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") }
+      # on the new connection B comes first, and takes the id A had on the old one
+      c.exec_params("DELETE FROM t WHERE v = $1 AND id = $2", [3, 3])
+      c.exec_params("UPDATE t SET v = $1 WHERE id = $2", [4, 4])
+      assert_equal [[A, [1, 1]], [B, [2, 2]], [B, [3, 3]], [A, [4, 4]]], table.executed
+      assert_equal [A, B, B, A], table.prepares # each prepared again on the new connection
+      c.close
+    end
+  end
+
+  def test_an_id_from_before_a_re_dial_runs_its_own_statement_not_the_one_that_took_its_number
+    with_table do |srv, table|
+      c = connect(srv)
+      a, = c.prepare_server(A)
+      b, = c.prepare_server(B)
+      srv.close_all # lost while idle
+      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") }
+      c.exec_params("DELETE FROM t WHERE v = $1 AND id = $2", [3, 3]) # B first on the new connection
+      # A, by the id obtained before the loss: prepared on the new connection first
+      assert_equal 1, c.exec_prepared(a, [4, 4], 1).cmd_tuples
+      assert_equal 1, c.exec_prepared(b, [5, 5], 1).cmd_tuples
+      assert_equal [[B, [3, 3]], [A, [4, 4]], [B, [5, 5]]], table.executed
+      assert_equal [A, B, B, A], table.prepares
+      # and again after another loss, met by exec_prepared itself
+      srv.close_all
+      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(b, [6, 6], 1) }
+      assert_equal 1, c.exec_prepared(a, [7, 7], 1).cmd_tuples
+      assert_equal [A, [7, 7]], table.executed.last
+      assert_equal 3, srv.connections
+      c.close
+    end
+  end
+
+  def test_an_id_another_connection_issued_is_refused
+    with_table do |srv, table|
+      one = connect(srv)
+      two = connect(srv)
+      a, = one.prepare_server(A)
+      two.prepare_server(B) # the same number on its own connection
+      e = assert_raises(Skaidb::QueryError) { two.exec_prepared(a, [1, 1], 1) }
+      assert_match(/not issued by this connection/, e.message)
+      assert_empty table.executed
+      assert two.usable?
+      # a pool is the same: an id stays with the connection that prepared it
+      pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret")
+      pool.with { |conn| assert_raises(Skaidb::QueryError) { conn.exec_prepared(a, [1, 1], 1) } }
+      assert_empty table.executed
+      pool.close
+      [one, two].each(&:close)
+    end
+  end
 end

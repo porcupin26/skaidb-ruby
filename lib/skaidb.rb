@@ -708,6 +708,15 @@ module Skaidb
     @nonce_mutex.synchronize { @nonce_counter += 1 }
   end
 
+  @dial_counter = 0
+
+  # Internal: a process-wide number for each socket a connection dials. It
+  # is the upper half of the prepared-statement ids that socket's
+  # connection hands out, so an id says which socket issued it.
+  def self.next_dial_serial
+    @nonce_mutex.synchronize { @dial_counter += 1 }
+  end
+
   # A connection to one skaidb node. Modelled on +PG::Connection+.
   class Connection
     # @return [Boolean] whether the connection has been closed
@@ -762,6 +771,11 @@ module Skaidb
       # prepare_cached).
       @prepared = {}
       @held = {}
+      # Every id prepare_server has handed out => its SQL, kept across
+      # re-dials: exec_prepared prepares the statement again when the id is
+      # from a socket this connection has since replaced.
+      @handles = {}
+      @serial = 0
       @last_prepare_error = nil
       # The session database, as the USE target every dial re-enters: the one
       # the connection was opened in (+database:+), and the one it is in now
@@ -781,6 +795,7 @@ module Skaidb
     # connect and for every reconnect, so a recovered connection is
     # indistinguishable from a fresh one.
     def dial!
+      @serial = Skaidb.next_dial_serial
       host = @dial_args[:host]
       port = @dial_args[:port]
       user = @dial_args[:user]
@@ -966,7 +981,7 @@ module Skaidb
       end
       raise ConnectionError, "connection is closed" if @closed
 
-      req = +([7, level].pack("CC") + [id].pack("V") + [ordered.length].pack("V"))
+      req = +([7, level].pack("CC") + [id & WIRE_ID].pack("V") + [ordered.length].pack("V"))
       ordered.each do |r|
         req << [r.length].pack("v")
         r.each do |v|
@@ -1274,14 +1289,23 @@ module Skaidb
     PREPARED_LIMIT = 240
     private_constant :PREPARED_LIMIT
 
-    # Execute a prepared statement with TYPED parameters. The id belongs to
-    # the socket that prepared it, so a broken connection is not re-dialled
-    # here: prepare_server does that, and hands out a new id.
+    # The lower half of an id is the server's statement number, the upper
+    # half the socket that issued it (see Skaidb.next_dial_serial).
+    WIRE_ID = 0xFFFF_FFFF
+    private_constant :WIRE_ID
+
+    # Execute a prepared statement with TYPED parameters, by the id
+    # prepare_server returned. An id is a number on the socket that issued
+    # it; on another socket the same number is unknown, or names a different
+    # statement prepared there since. So an id from a socket this connection
+    # has since replaced is not sent: its statement is prepared again on the
+    # current socket first (a broken connection re-dials for it, as for any
+    # statement). An id another connection issued is refused with QueryError.
     def exec_prepared(id, params, consistency)
       raise ConnectionError, "connection is closed" if @closed
-      raise ConnectionError, "connection is broken; prepare the statement again" if @broken
 
-      req = +([3, consistency].pack("CC") + [id].pack("V") + [params.length].pack("v"))
+      id = current_id(id)
+      req = +([3, consistency].pack("CC") + [id & WIRE_ID].pack("V") + [params.length].pack("v"))
       params.each do |p|
         v = Skaidb.encode_value(p)
         req << [v.bytesize].pack("V") << v
@@ -1563,6 +1587,7 @@ module Skaidb
 
       if (hit = @prepared.delete(sql))
         (hold ? @held : @prepared)[sql] = hit # held from now on, or most recently used
+        @handles[hit[0]] = sql if hold
         return hit
       end
 
@@ -1573,8 +1598,9 @@ module Skaidb
       tag = reader.u8
       case tag
       when 4
-        id = reader.u32
+        id = (@serial << 32) | reader.u32
         nparams = reader.u16
+        @handles[id] = sql if hold
         (hold ? @held : @prepared)[sql] = [id, nparams]
       when 3
         msg = reader.text
@@ -1592,8 +1618,24 @@ module Skaidb
     # Free a prepared statement's slot on the server (OP_CLOSE). What it
     # answers does not matter: the id is forgotten here either way.
     def close_prepared(id)
-      request([4].pack("C") + [id].pack("V"))
+      request([4].pack("C") + [id & WIRE_ID].pack("V"))
       nil
+    end
+
+    # exec_prepared's id as the current socket knows it: the id itself when
+    # this socket issued it; otherwise the id of the same statement prepared
+    # here again — never a number another socket gave out.
+    def current_id(id)
+      ensure_live!
+      return id if id >> 32 == @serial
+
+      sql = @handles[id]
+      raise QueryError, "prepared statement id #{id} was not issued by this connection" if sql.nil?
+
+      entry = prepare_cached(sql, hold: true)
+      raise QueryError, "the statement could not be prepared again: #{@last_prepare_error}" if entry.nil?
+
+      entry[0]
     end
 
     # The transaction helper's clean-up after a block that did not run to its
