@@ -1406,7 +1406,6 @@ module Skaidb
       parse_response(reader)
     end
 
-    # Close the connection. Idempotent.
     # Yield a stream's events as they arrive, forever.
     #
     # A dependency-free helper over the stream's log: pages it with the
@@ -1447,6 +1446,7 @@ module Skaidb
       !@closed && !@broken && !@streaming
     end
 
+    # Close the connection. Idempotent.
     def close
       return if @closed
 
