@@ -202,51 +202,56 @@ nothing noted when it returns.
 
 ### Reconnect
 
-A transport failure raises `Skaidb::ConnectionError` and marks the
-connection broken. So does a reply that cannot be read — a tag the protocol
-does not have, a message shorter than its own fields say — whichever call
-it answers: what follows it on the socket cannot be placed. (A reply of the
-wrong kind to a prepare or to a stream request is raised as `QueryError`;
-the connection is marked broken all the same.) A statement cut short between its request and its reply
-by anything else (an `Interrupt`, `Timeout.timeout`, `Thread#kill`) marks it
+**What breaks a connection.** A transport failure raises
+`Skaidb::ConnectionError` and marks the connection broken. So does a reply
+that cannot be read — a tag the protocol does not have, a message shorter
+than its own fields say — whichever call it answers: what follows it on the
+socket cannot be placed. (A reply of the wrong kind to a prepare or to a
+stream request is raised as `QueryError`; the connection is marked broken
+all the same.) A statement cut short between its request and its reply by
+anything else (an `Interrupt`, `Timeout.timeout`, `Thread#kill`) marks it
 broken too, since that reply is still on its way; the exception propagates
 as it is. A connection marked broken closes its socket there and then, so
 the server drops the session — and a transaction left open on it — without
 waiting for the connection's next statement or its `close`.
 
-Before each request is written the connection is looked at (a poll of the
-TCP socket and at most one peek, never a round trip): an idle connection has
-nothing to read, so an end-of-file, a reset or bytes nobody asked for mean
-the server closed it while it sat idle. It is then marked broken like any
-other lost connection — but nothing was sent on it, so nothing is raised:
-the statement re-dials and runs. A connection in the middle of a stream is
-not idle and is not looked at.
+**A connection lost while idle.** Before each request is written the
+connection is looked at (a poll of the TCP socket and at most one peek,
+never a round trip): an idle connection has nothing to read, so an
+end-of-file, a reset or bytes nobody asked for mean the server closed it
+while it sat idle. It is then marked broken like any other lost connection
+— but nothing was sent on it, so nothing is raised: the statement re-dials
+and runs. A connection in the middle of a stream is not idle and is not
+looked at.
 
-A broken connection's next
-`exec`/`exec_params`/`exec_batch`/`exec_prepared`/`stream`
-re-dials across the original seeds (a pooled connection: in the pool's
-order, usable members first and the one it lost last), re-authenticates,
-re-sends `Hello`, re-enters the session's database, sends the session's
-settings again, and starts with an empty
-prepared-statement cache. The database is the one the session was last in:
-`database:`, or the name of the last `USE [DATABASE] <name>` statement the
-server accepted from `exec`, `query`, `exec_params` or `stream` (the name
-bare or double-quoted, an optional trailing `;`, `--` comments skipped as
-the server skips them; the name is kept as it was written and sent again
-in a `USE` of its own). It is entered before anything else is sent, and a refusal is
-raised to the statement that caused the re-dial — which is not sent — so no
-statement runs in another database. When that statement is itself a `USE`
-the driver can read, the database the session is leaving is not entered
-first: the settings are put back and the `USE` is sent, and its answer
-decides the session database as usual. A session whose database was
-dropped while its connection was down fails every statement with the
-`USE`'s error (`database "app" does not exist`), and is moved out of it
-with a `USE` of another database. A `USE` that this new session refuses
-leaves it in no database the application chose, so it is closed: the next
-statement dials again and fails as before, rather than running in the
-default database.
+**The re-dial.** A broken connection's next `exec`, `exec_params`,
+`exec_batch`, `exec_prepared` or `stream` re-dials across the original
+seeds (a pooled connection: in the pool's order, usable members first and
+the one it lost last), re-authenticates, re-sends `Hello`, puts the session
+back as it was — its database, then its settings — and starts with an
+empty prepared-statement cache. If the re-dial fails, that statement raises
+`ConnectionError` and the one after it tries again.
 
-The settings are the last `SET CONSISTENCY …` and the last
+**The database** is the one the session was last in: `database:`, or the
+name of the last `USE [DATABASE] <name>` statement the server accepted from
+`exec`, `query`, `exec_params` or `stream` (the name bare or double-quoted,
+an optional trailing `;`, `--` comments skipped as the server skips them;
+the name is kept as it was written and sent again in a `USE` of its own).
+It is entered before anything else is sent, and a refusal is raised to the
+statement that caused the re-dial — which is not sent — so no statement
+runs in another database.
+
+When that statement is itself a `USE` the driver can read, the database the
+session is leaving is not entered first: the settings are put back and the
+`USE` is sent, and its answer decides the session database as usual. So a
+session whose database was dropped while its connection was down fails
+every statement with the `USE`'s error (`database "app" does not exist`),
+and is moved out of it with a `USE` of another database. A `USE` that this
+new session refuses leaves it in no database the application chose, so it
+is closed: the next statement dials again and fails as before, rather than
+running in the default database.
+
+**The settings** are the last `SET CONSISTENCY …` and the last
 `SET SCAN BUDGET …` statement the server accepted (from the same four
 calls; one note per kind, the statement kept as written without its `--`
 comments). They are sent after the database and before the statement, in
@@ -259,13 +264,11 @@ that is not exactly one such statement is not followed. (`consistency=` is
 not a session setting: it is the level each request carries, and needs no
 restoring.)
 
-If the re-dial fails, that statement
-raises `ConnectionError` and the
-one after it tries again. Inside a transaction — the helper's, or one
-opened with a `BEGIN` statement — there is no re-dial: the transaction
-ended with its socket, so every further statement raises `ConnectionError`
-until the helper returns, or until a hand-written transaction's `ROLLBACK`
-or `COMMIT` ends it (see [Transactions](#transactions)).
+**Inside a transaction** — the helper's, or one opened with a `BEGIN`
+statement — there is no re-dial: the transaction ended with its socket, so
+every further statement raises `ConnectionError` until the helper returns,
+or until a hand-written transaction's `ROLLBACK` or `COMMIT` ends it (see
+[Transactions](#transactions)).
 
 ## `Skaidb::Result`
 

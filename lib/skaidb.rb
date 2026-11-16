@@ -2034,15 +2034,16 @@ module Skaidb
     #   in the default database, where a table of the same name is another
     #   table); after a SET it has that setting, and a re-dial sends it
     #   again (see restore_session). One note per kind: the last statement
-    #   the server accepted. After BEGIN a transaction is open, and until it ends a lost
-    #   connection is not replaced: PROTOCOL.md §6 rule 7 holds for a
-    #   transaction the application writes itself exactly as inside the
-    #   helper. After COMMIT or ROLLBACK it is over.
+    #   the server accepted. After BEGIN a transaction is open, and until it
+    #   ends a lost connection is not replaced: PROTOCOL.md §6 rule 7 holds
+    #   for a transaction the application writes itself exactly as inside
+    #   the helper. After COMMIT or ROLLBACK it is over.
     # - An Error from the server (QueryError): a USE, a SET or a BEGIN it
     #   refused changed nothing. (A USE refused on a socket dialled for it
     #   leaves that socket in no database the driver noted: it is retired,
-    #   and the next statement dials into the noted one again.) A COMMIT it refused has ended the transaction all
-    #   the same, and so has a ROLLBACK.
+    #   and the next statement dials into the noted one again.) A COMMIT it
+    #   refused has ended the transaction all the same, and so has a
+    #   ROLLBACK.
     # - No answer the driver could read — the connection lost under the
     #   statement, a reply that makes no sense, or an exception no statement
     #   raised (a Timeout, an Interrupt) anywhere in between: whether the
