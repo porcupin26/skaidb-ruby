@@ -396,6 +396,39 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_re_dial_cut_short_does_not_leave_a_half_made_connection_to_the_next_statement
+    interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with
+    with_server do |srv|
+      gate = Queue.new
+      answers = FakeSkaidb.scripted("SELECT 1" => F.rows(["c"], [[1]]), "SELECT 2" => F.rows(["c"], [[2]]))
+      hellos = 0
+      srv.handler = lambda do |req, conn|
+        next answers.call(req, conn) unless req.op == 8
+
+        (hellos += 1) == 2 ? (gate.pop && F.ddl) : F.ddl # the second connection's Hello is sat on
+      end
+      c = connect(srv)
+      srv.close_all
+      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } # meets the loss
+      worker = Thread.new do
+        Thread.current.report_on_exception = false
+        c.exec("SELECT 1") # re-dials: handshake, then Hello — whose reply does not come
+      end
+      begin
+        until_true { srv.hellos.length == 2 }
+        until_true { worker.status == "sleep" }
+        worker.raise(interrupt)
+        assert_raises(interrupt) { worker.join(2) || flunk("the re-dial went on waiting") }
+      ensure
+        gate << true # Hello's reply now arrives on the half-made connection
+      end
+      # the next statement reads its own reply — not Hello's — on a third socket
+      assert_equal [[2]], c.exec("SELECT 2").rows
+      assert_equal 3, srv.connections
+      c.close
+    end
+  end
+
   def test_a_round_trip_cut_short_retires_the_socket_instead_of_leaving_its_reply_to_the_next_statement
     interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with: not a StandardError
     calls = {

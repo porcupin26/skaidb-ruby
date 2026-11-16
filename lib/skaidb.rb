@@ -1406,11 +1406,16 @@ module Skaidb
       # Cleared BEFORE dialling: dial! issues USE, which runs a statement and
       # would otherwise re-enter this method forever.
       @broken = false
+      dialled = false
       begin
         dial!
-      rescue StandardError => e
-        @broken = true          # still down; the next statement retries
-        raise e
+        dialled = true
+      ensure
+        # Still down, so the next statement retries — or the dial was cut
+        # short (an Interrupt, a Timeout) with the handshake's or Hello's
+        # reply outstanding on the new socket, which the next statement
+        # would read as its own.
+        mark_broken! unless dialled
       end
     end
 
