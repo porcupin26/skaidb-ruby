@@ -25,7 +25,10 @@ class CertificateAuthTest < Minitest::Test
     def client(cn)
       key = OpenSSL::PKey::EC.generate("prime256v1")
       cert = issue("CN=#{cn}", key, @ca, @ca_key)
-      [write("#{cn}.crt", cert.to_pem), write("#{cn}.key", key.private_to_pem)]
+      # private_to_pem (PKCS#8) where the openssl library has it; before
+      # Ruby 3.0 to_pem writes the private key, in the traditional form
+      pem = key.respond_to?(:private_to_pem) ? key.private_to_pem : key.to_pem
+      [write("#{cn}.crt", cert.to_pem), write("#{cn}.key", pem)]
     end
 
     def path(name)
