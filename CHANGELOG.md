@@ -4,6 +4,98 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-11-16
+
+### Fixed
+- **A connection the server closed while it sat idle costs no statement.**
+  A member restart, a failover or an idle timeout closes idle connections,
+  and the first statement on each of them raised `ConnectionError` — once
+  per idle connection, after every restart; only the statement after it
+  re-dialled. The driver now looks at the socket before it writes a request
+  (one peek that does not wait, no round trip): an idle connection has
+  nothing to read, so an end-of-file, a reset or bytes nobody asked for
+  mean it is gone, and the statement runs on a new connection with the
+  session restored on it. A pool does not hand out an idle connection that
+  was lost. Under TLS the TCP socket is looked at, and bytes the TLS layer
+  has already decrypted count too. A connection lost *under* a statement —
+  request written, no reply — still raises `ConnectionError`, since the
+  statement may have run.
+- **A pool hands every borrower its own session state.** A pooled
+  connection kept what its last borrower had done to the session: a `USE`
+  (on a pool without `database:`), a `SET CONSISTENCY`, a `SET SCAN BUDGET`,
+  a transaction left open. The next borrower read another database's
+  tables, was refused for someone else's scan budget, or had its writes
+  swallowed by a transaction it knew nothing of. A connection now reaches
+  each borrower in the pool's database (`database:`, or `default` when the
+  pool names none) with no transaction open and neither setting: what a
+  borrower changed is put back when the connection is returned (`ROLLBACK`,
+  `USE`, `SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`, only the
+  ones needed), and a connection that cannot be put back is closed.
+- **`SET CONSISTENCY` and `SET SCAN BUDGET` survive a re-dial.** Both are
+  state of the server's session, and a re-dialled connection came back
+  without them: a scan the application had limited ran unlimited, a read
+  asked for at `ALL` ran at the request's own level. The last one of each
+  the server accepted is now sent again on every dial, after the database
+  and before the statement; `… DEFAULT` clears it. A setting the new
+  session refuses fails the statement instead of letting it run without.
+- **A transaction written by hand is a transaction to the driver too.**
+  Only `transaction` kept a lost connection from being replaced. After
+  `exec("BEGIN")` a lost connection was re-dialled, and the rest of the
+  statements — and the `COMMIT` — ran on a new session, each committed on
+  its own. A `BEGIN` the server accepted is now followed until `COMMIT` or
+  `ROLLBACK` ends it: while it is open a lost connection is not replaced,
+  every statement raises `ConnectionError`, `ROLLBACK` succeeds without
+  being sent and `COMMIT` raises (`COMMIT was not sent and nothing was
+  committed`). A connection lost under the `COMMIT` itself says that the
+  outcome is not known, from `transaction` as well.
+- **A `USE` gets a connection out of a database that is gone.** When the
+  session's database had been dropped and the connection was lost, every
+  statement failed at the re-dial's `USE` — and so did a `USE` of another
+  database, because the old one was entered first. A `USE` is now sent to
+  the new session without that.
+- **`transaction` cut short between two statements leaves no transaction
+  open.** A `Timeout` or an `Interrupt` landing just after the opening
+  statement's reply, or with the block done and `COMMIT` not yet written,
+  left the transaction open on a connection that went on being used. The
+  socket is now closed unless the server has answered a `ROLLBACK` or the
+  `COMMIT`.
+- **A reply that cannot be read drops the connection.** An unknown
+  response tag or a message shorter than its own fields say raised
+  `ConnectionError` and left the connection usable, with whatever followed
+  on the socket for the next statement to read as its reply.
+- A stream cut short between its header frame and its first row (a
+  `Timeout`, an `Interrupt`) left the rest of the stream on a connection
+  that looked idle. It is now marked broken.
+- A dial that moved on from an endpoint whose handshake failed to one that
+  answered left the connection marked broken: `usable?` was false on a
+  healthy socket, the next statement dialled again, and a pool threw the
+  connection away and dialled once more.
+- A connect that failed after its handshake (a `database:` the server
+  refuses, a connect cut short) left its socket open until the collector
+  closed it. It is closed at once.
+- Under `ruby -w` on Ruby 2.7, a dial whose first endpoint refused the
+  connection printed `instance variable @sock not initialized`.
+
+### Changed
+- On a pool without a `database:` option a borrower's `USE` no longer
+  carries over to later borrowers: the connection goes back to `default`
+  when it is returned. Send `USE` after each checkout, or give the
+  database a pool of its own (`database:`).
+- A pool puts a connection back in its own state when the connection is
+  returned, not when it is next handed out; a borrower that left a
+  transaction open has it rolled back there.
+- The statement that finds its connection closed by a restart no longer
+  raises `ConnectionError`: code that caught it and ran the statement again
+  keeps working, and no longer needs to.
+- After a connection is lost inside a hand-written `BEGIN` … `COMMIT`, every
+  statement raises `ConnectionError` until `ROLLBACK` or `COMMIT` ends the
+  transaction; they used to run on a new session.
+
+### Added
+- `Connection#lost_while_idle?` — the look at the socket on its own.
+- `examples/transaction.rb`; the opt-in live test covers transactions and
+  session state.
+
 ## [1.5.1] - 2026-11-16
 
 ### Fixed
@@ -353,6 +445,7 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.5.2]: https://github.com/porcupin26/skaidb-ruby/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.4.0...v1.4.1
