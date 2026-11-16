@@ -1562,11 +1562,36 @@ module Skaidb
       @mutex.synchronize { !@broken && !@streaming && peer_gone? }
     end
 
-    # Internal, for Pool: put the session back in the database the connection
-    # was opened in (+database:+) when a USE statement has moved it since.
-    # One round trip, and none when there is nothing to put back.
-    def reenter_dial_database
-      exec("USE #{@dial_use}") if @dial_use && @session_use != @dial_use
+    # Internal, for Pool: the connection comes back from a borrower, and the
+    # next one must find it as a new connection would be — no transaction
+    # open, in the database it was opened in (+database:+, or +default+,
+    # where every session starts), with no scan budget and no consistency
+    # override. What the notes say the borrower changed is put back, in
+    # that order, and only that: a borrower that changed nothing costs no
+    # round trip. The notes are back to the dial's own with it, so a re-dial
+    # under the next borrower restores this state and not the last
+    # borrower's.
+    #
+    # Returns whether the session is in that state. False when it could not
+    # be put there — a statement refused (a server before 0.349 has no SET
+    # CONSISTENCY DEFAULT), the connection gone — and the pool then closes
+    # the connection instead of keeping it. A connection found lost is not
+    # dialled again for this: there is nothing on a new one to put back.
+    def reset_session
+      return false unless usable?
+      return true unless @transaction || @session_use != @dial_use || @session_scan_budget || @session_consistency
+      return false if lost_while_idle?
+
+      exec("ROLLBACK") if @transaction
+      if @session_use != @dial_use
+        exec("USE #{@dial_use || 'default'}")
+        @session_use = @dial_use
+      end
+      exec("SET SCAN BUDGET DEFAULT") if @session_scan_budget
+      exec("SET CONSISTENCY DEFAULT") if @session_consistency
+      usable?
+    rescue Error
+      false
     end
 
     private
@@ -2299,6 +2324,12 @@ module Skaidb
   # starting members, and the rest (TLS, the session database, ...) apply to
   # every connection.
   #
+  # Every borrower gets the pool's own session state: the pool's database
+  # (+database:+, or +default+ when it names none), no transaction open, no
+  # consistency override and no scan budget of an earlier borrower. What a
+  # borrower changed is put back when the connection is returned (see
+  # checkin), and a connection that cannot be put back is closed.
+  #
   # Load balancing (PROTOCOL.md §6.1, the same in every skaidb driver; see
   # docs/pooling.md):
   #
@@ -2471,9 +2502,6 @@ module Skaidb
           # borrower gets another idle connection or a new one.
           close_quietly(conn)
           next
-        elsif !in_pool_database?(conn)
-          close_quietly(conn)
-          next
         end
         @mutex.synchronize do
           m = @members[conn.pool_member]
@@ -2487,21 +2515,31 @@ module Skaidb
 
     # Return a connection, closing it if it is broken, its member is ejected
     # or gone, or the pool is full.
+    #
+    # A connection the pool keeps is first put back in the pool's own
+    # session state (Connection#reset_session): whatever its borrower left
+    # — a transaction open, another database, a scan budget, a consistency
+    # override — the next borrower gets a session in the pool's database
+    # with none of it. That takes round trips only when the borrower
+    # changed something, and a connection that cannot be put back is closed.
     def checkin(conn)
-      keep = @mutex.synchronize do
+      keep = false
+      wanted = @mutex.synchronize do
         if conn.pool_out
           conn.pool_out = false
           counted = @members[conn.pool_member]
           counted.in_use -= 1 if counted && counted.in_use.positive?
         end
-        m = @members[conn.pool_member]
-        if !@closed && conn.usable? && m && usable?(m) && @idle.length < @maxsize
-          @idle.push(conn)
-          true
-        else
-          false
-        end
+        keepable?(conn)
       end
+      # Outside the pool's lock: these are round trips. (One the pool would
+      # close anyway is closed as it is.)
+      return unless wanted && conn.reset_session
+
+      keep = @mutex.synchronize do
+        @idle.push(conn) if keepable?(conn)
+      end
+    ensure
       close_quietly(conn) unless keep
     end
 
@@ -2671,15 +2709,12 @@ module Skaidb
       nil
     end
 
-    # An idle connection its last borrower moved with a USE statement goes
-    # back to the pool's +database:+ before it is handed out again; false
-    # when that fails (the connection is then dropped). A pool without
-    # +database:+ has no database to put it back in.
-    def in_pool_database?(conn)
-      conn.reenter_dial_database
-      true
-    rescue Error
-      false
+    # Whether a returned connection would join the idle set (the caller
+    # holds @mutex): the pool is open and has room, the connection is in
+    # order, and its member still takes connections.
+    def keepable?(conn)
+      m = @members[conn.pool_member]
+      !@closed && conn.usable? && !m.nil? && usable?(m) && @idle.length < @maxsize
     end
 
     def log(message)

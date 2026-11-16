@@ -309,7 +309,13 @@ A thread-safe pool balanced across the cluster's members — see
   a look at its socket (no round trip) and closed, and the checkout goes on
   to the next idle connection or dials.
 - `checkin(conn)` — return it; closed instead when broken, when its member
-  is ejected or gone, or when `maxsize` are already idle.
+  is ejected or gone, or when `maxsize` are already idle. A connection the
+  pool keeps is first put back in the pool's session state — `ROLLBACK` for
+  a transaction its borrower left open, `USE` of the pool's database
+  (`database:`, or `default`), `SET SCAN BUDGET DEFAULT`,
+  `SET CONSISTENCY DEFAULT`, each only if the borrower's statements made it
+  necessary — and closed if one of them fails. See
+  [pooling.md](pooling.md).
 - `members → Array<Hash>` — per member: `:endpoint`, `:canonical`, `:state`
   (`:ready`, `:ejected`, `:resyncing`, `:unreachable`, `:unlisted`),
   `:latency_ms` (`nil` until measured), `:in_use`, `:idle`, `:seed`.

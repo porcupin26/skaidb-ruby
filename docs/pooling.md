@@ -56,15 +56,31 @@ pool.close
 (`database`, TLS, `consistency`, `timeout`) apply to every connection, so
 pooled connections run `USE` and authenticate exactly like single ones. A
 pooled connection that re-dials after a transport error does so in the
-pool's order: usable members first, the one it lost last. A borrower that
-sends its own `USE` moves that connection only while it holds it: a pool
-with `database:` puts an idle connection back in that database before it
-hands it out again (one extra round trip, only when it was moved; a
-connection that cannot be put back is dropped). A pool without `database:`
-has no database to put it back in, so there a borrower's `USE` stays with
-the connection — send `USE` after every checkout if borrowers use different
-databases.
+pool's order: usable members first, the one it lost last.
 `Connection#endpoint` names the member a connection reached.
+
+**Every borrower gets the pool's own session state.** A pooled connection
+reaches each borrower
+
+- in the pool's database: its `database:` option, or `default` — the
+  database every new connection starts in — when the pool names none;
+- with no transaction open;
+- with no `SET CONSISTENCY` override and no `SET SCAN BUDGET` of an earlier
+  borrower.
+
+What a borrower changed is put back when the connection is returned, before
+anyone else can get it: `ROLLBACK` for a transaction left open (a `BEGIN`
+with no `COMMIT` or `ROLLBACK` after it), `USE <the pool's database>`,
+`SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT` — only the ones the
+borrower's statements made necessary, so a borrower that changed nothing
+costs no round trip. A connection that cannot be put back is closed instead
+of kept: one of the statements was refused (a server before 0.349 has no
+`SET CONSISTENCY DEFAULT`), or the connection is gone. While a borrower
+holds a connection, its own `USE` and settings follow it across re-dials as
+on any connection; once it is returned they are forgotten, so a re-dial
+under the next borrower restores the pool's state. To work in another
+database, send `USE` after the checkout, or give that database a pool of
+its own.
 
 ## Balancing across members
 

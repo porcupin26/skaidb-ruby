@@ -383,6 +383,13 @@ undrained stream is closed and replaced; and an idle connection the server
 closed while it sat in the pool is found by a look at its socket (no round
 trip) and replaced before it is handed out.
 
+Every borrower gets the pool's own session state: the pool's database
+(`database:`, or `default` when it names none), no transaction open, and no
+`SET CONSISTENCY` or `SET SCAN BUDGET` of an earlier borrower. Whatever a
+borrower changed is put back when the connection is returned — a `ROLLBACK`,
+a `USE`, a `SET … DEFAULT`, only the ones needed — and a connection that
+cannot be put back is closed.
+
 The pool spreads its connections across the members by the rules every skaidb
 driver shares
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)):

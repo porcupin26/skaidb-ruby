@@ -330,16 +330,33 @@ class SessionDatabaseTest < Minitest::Test
         c.exec("USE other")
         c.exec(INSERT)
       end
+      # put back in the pool's database when it came back
+      assert_equal [%(USE "app"), "USE other", INSERT, %(USE "app")], since(srv, 0)
       mark = srv.requests.length
       pool.with do |c|
         assert_same first, c # the same connection, handed out again
         c.exec(COUNT)
       end
-      # put back in the pool's database before the borrower's first statement
-      assert_equal [%(USE "app"), COUNT], since(srv, mark)
-      mark = srv.requests.length
       pool.with { |c| c.exec(COUNT) } # nothing to put back: no extra round trip
-      assert_equal [COUNT], since(srv, mark)
+      assert_equal [COUNT, COUNT], since(srv, mark)
+      assert_equal 1, srv.connections
+      pool.close
+    end
+  end
+
+  def test_a_borrowers_use_does_not_reach_the_next_borrower_of_a_pool_without_a_database_either
+    with_server do |srv|
+      srv.handler = handler
+      pool = pool_for(srv)
+      first = pool.with { |c| c.exec("USE other") && c.exec(INSERT) && c }
+      # the pool names no database, so its connections are at home where
+      # every new connection starts: in default
+      assert_equal ["USE other", INSERT, "USE default"], since(srv, 0)
+      pool.with do |c|
+        assert_same first, c
+        c.exec(COUNT)
+      end
+      assert_equal ["USE other", INSERT, "USE default", COUNT], since(srv, 0)
       assert_equal 1, srv.connections
       pool.close
     end
@@ -355,11 +372,11 @@ class SessionDatabaseTest < Minitest::Test
         first = c
         c.exec("USE other")
       end
+      assert first.finished? # closed when it came back and could not be put back
       pool.with do |c|
         refute_same first, c
         assert_equal 3, c.exec(COUNT)[0]["count"]
       end
-      assert first.finished?
       assert_equal 2, srv.connections
       pool.close
     end
