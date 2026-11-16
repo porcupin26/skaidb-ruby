@@ -862,6 +862,10 @@ module Skaidb
             handshake(user.to_s, password.to_s)
           end
           @endpoint = "#{h}:#{prt}"
+          # A handshake that failed on an endpoint tried before this one
+          # marked the connection broken where its read or write failed.
+          # That was said of a socket that is gone; this one answered.
+          @broken = false
           last = nil
           break
         rescue StandardError => e

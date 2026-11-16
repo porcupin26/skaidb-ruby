@@ -465,6 +465,71 @@ class ClientTest < Minitest::Test
     end
   end
 
+  # A connection given its endpoints in a fixed order, as a pool gives them.
+  def connect_in_order(*servers, **kw)
+    opts = Skaidb.connection_options(user: "ada", password: "secret", **kw)
+    Skaidb::Connection.new(**opts, endpoints: servers.map { |s| ["127.0.0.1", s.port] })
+  end
+
+  def test_a_dial_that_moves_on_to_the_next_endpoint_is_not_left_marked_broken
+    with_server do |down|
+      with_server do |srv|
+        down.refuse = true # its port accepts, then hangs up where the handshake's reply should be
+        srv.handler = FakeSkaidb.scripted(ONE => ONE_ROW, %(USE "app") => F.ddl)
+        c = connect_in_order(down, srv)
+        assert_equal "127.0.0.1:#{srv.port}", c.endpoint
+        # the socket that answered is a healthy one: nothing about it is broken
+        assert c.usable?
+        assert_equal 1, c.exec(ONE)[0]["c"]
+        assert_equal 1, srv.connections # ... and the statement ran on it, not on a second one
+        c.close
+        # with a database to enter: one USE, on that one socket
+        c = connect_in_order(down, srv, database: "app")
+        assert c.usable?
+        assert_equal 1, c.exec(ONE)[0]["c"]
+        assert_equal 2, srv.connections
+        assert_equal 1, srv.requests.count { |q| q.sql == %(USE "app") }
+        c.close
+      end
+    end
+  end
+
+  def test_a_re_dial_that_moves_on_to_the_next_endpoint_is_not_left_marked_broken
+    with_server do |first|
+      with_server do |second|
+        [first, second].each { |s| s.handler = FakeSkaidb.scripted(ONE => ONE_ROW, "SELECT lost" => :close) }
+        c = connect_in_order(first, second)
+        assert_equal "127.0.0.1:#{first.port}", c.endpoint
+        assert_raises(Skaidb::ConnectionError) { c.exec("SELECT lost") }
+        first.refuse = true # the member is going down: the re-dial tries it first, in vain
+        assert_equal 1, c.exec(ONE)[0]["c"]
+        assert_equal "127.0.0.1:#{second.port}", c.endpoint
+        assert c.usable?
+        assert_equal 1, c.exec(ONE)[0]["c"]
+        assert_equal 1, second.connections
+        c.close
+      end
+    end
+  end
+
+  def test_a_pool_keeps_the_connection_whose_dial_moved_on_to_another_member
+    with_server do |down|
+      with_server do |srv|
+        down.refuse = true
+        srv.handler = FakeSkaidb.scripted(ONE => ONE_ROW)
+        pool = Skaidb::Pool.new(seeds: ["127.0.0.1:#{down.port}", "127.0.0.1:#{srv.port}"], user: "ada",
+                                password: "secret", load_balancing: :round_robin, eject_errors: 100)
+        # round robin: one of the two checkouts dials the member that is down first
+        held = Array.new(2) { pool.checkout }
+        held.each { |c| assert_equal 1, c.exec(ONE)[0]["c"] }
+        # each got the socket its dial made; none was thrown away as broken and dialled again
+        assert_equal 2, srv.connections
+        held.each { |c| pool.checkin(c) }
+        pool.close
+      end
+    end
+  end
+
   def test_a_lost_connection_is_re_dialled_on_the_next_statement_and_prepared_ids_are_dropped
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted(
