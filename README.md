@@ -519,6 +519,12 @@ What else `transaction` does:
   still on its way, so nothing more is written to that socket. Either way
   the socket is closed at once, and the server drops the transaction with
   it.
+- Such an exception can also land between two statements — just after the
+  opening statement's reply, or with the block done and `COMMIT` not yet
+  written. `transaction` never leaves a transaction open on a connection
+  that goes on being used: unless the server has answered a `ROLLBACK` or
+  the `COMMIT`, the socket is closed, the server drops the transaction with
+  it, and the connection's next statement re-dials.
 - A stream the block leaves open — an Enumerator from `stream` advanced with
   `next` or `peek` and not read to its end — sits in the middle of its
   reply, so neither `COMMIT` nor `ROLLBACK` can be sent. The socket is

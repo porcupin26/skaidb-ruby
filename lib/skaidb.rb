@@ -1064,6 +1064,13 @@ module Skaidb
     #   Interrupt, a Timeout): the reply is still on its way, so nothing more
     #   is written to that socket. Either way the socket is closed at once,
     #   and the server drops the transaction with it.
+    # - Such an exception can also land between two statements — just after
+    #   the opening statement's reply, or with the block done and COMMIT not
+    #   yet written — where no round trip is under way. The helper is never
+    #   left with a transaction open on a usable connection: unless the
+    #   server has answered a ROLLBACK or the COMMIT, the socket is closed,
+    #   the server drops the transaction with it, and the next statement
+    #   re-dials.
     # - A stream the block leaves open — an Enumerator from +stream+ advanced
     #   with +next+ or +peek+ and not read to its end — sits in the middle of
     #   its reply, so neither COMMIT nor ROLLBACK can be sent. The socket is
@@ -1085,10 +1092,29 @@ module Skaidb
 
       enclosing = @in_transaction
       attempt = 0
+      # Whether the transaction is over, by what the server answered: the
+      # opening statement refused, a ROLLBACK or the COMMIT answered. False
+      # from the moment the opening statement is handed over, and whenever
+      # the helper is left with it still false the session goes (see the
+      # ensure). Most ways out with it false have lost the socket already;
+      # the one that has not is an exception no statement raised — a
+      # Timeout, an Interrupt — that lands between two statements: just
+      # after the opening statement's reply, or with the block done and
+      # COMMIT not yet written. No round trip is under way there, so the
+      # connection is in order, and the server holds a transaction that
+      # nothing will end: left usable, the connection would run its next
+      # statements inside it, uncommitted.
+      over = true
       begin
         attempt += 1
         committing = false
-        exec(opening)
+        over = false
+        begin
+          exec(opening)
+        rescue QueryError
+          over = true # refused — or a re-dial's own statement was: nothing is open
+          raise
+        end
         @in_transaction = true
         finished = false
         begin
@@ -1096,14 +1122,20 @@ module Skaidb
           finished = true
         ensure
           abandoned = abandon_open_stream
-          rollback_quietly unless finished
+          over = true if !finished && rollback_quietly
         end
         if abandoned
           raise ConnectionError, "a stream opened inside the transaction was left open, so COMMIT could not " \
                                  "be sent: its session was dropped and nothing was committed"
         end
         committing = true
-        exec("COMMIT")
+        begin
+          exec("COMMIT")
+        rescue QueryError
+          over = true # a COMMIT the server refuses has ended the transaction
+          raise
+        end
+        over = true
         value
       rescue TransactionConflict
         # Only a refused COMMIT is run again; a conflict the block raised
@@ -1114,6 +1146,11 @@ module Skaidb
         retry
       ensure
         @in_transaction = enclosing
+        # Not known to be over: the socket is closed, and the server drops
+        # the transaction with the session. (Not a ROLLBACK from here: what
+        # is unwinding may be a timeout, and whether the opening statement
+        # was sent at all is not known.)
+        mark_broken! unless over
       end
     end
 
@@ -1698,10 +1735,18 @@ module Skaidb
     # replace what the block left with. Not sent on a connection that is not
     # usable — its socket died, or was left in the middle of a reply: the
     # transaction goes with the socket.
+    #
+    # Returns whether the server answered it: the transaction is over then,
+    # also when the answer was an error.
     def rollback_quietly
-      exec("ROLLBACK") if usable?
+      return false unless usable?
+
+      exec("ROLLBACK")
+      true
+    rescue QueryError
+      true
     rescue StandardError
-      nil
+      false
     end
 
     # Internal: raised into the Fiber of a stream the transaction helper's

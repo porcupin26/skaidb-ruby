@@ -128,6 +128,12 @@ yields the connection, then sends `COMMIT`.
   transaction ends with that socket, which is closed at once — the server
   drops the transaction with it — and which the next statement after
   `transaction` replaces.
+- The same exception landing between two statements — just after the
+  opening statement's reply, or with the block done and `COMMIT` not yet
+  written — finds no round trip under way. Unless the server has answered a
+  `ROLLBACK` or the `COMMIT`, `transaction` closes the socket on its way
+  out, so no transaction stays open on a connection that is still
+  `usable?`; the exception propagates as it is.
 - A stream the block leaves open (an Enumerator from `stream` advanced with
   `next`/`peek` and not read to its end) sits in the middle of its reply, so
   neither `COMMIT` nor `ROLLBACK` can be sent. The connection is marked

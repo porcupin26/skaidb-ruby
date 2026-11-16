@@ -349,6 +349,107 @@ class TransactionTest < Minitest::Test
     end
   end
 
+  # ---- an exception that lands between two of the helper's statements ------
+  #
+  # Timeout.timeout, an Interrupt or Thread#raise can land anywhere — also
+  # where no round trip is under way: just after BEGIN's reply was read, or
+  # with the block done and COMMIT not yet written. Nothing is in flight
+  # there, so the socket is in order; but the server holds a transaction the
+  # helper will never end. The helper must not leave that on a connection
+  # that goes on being used: its statements would run inside it, uncommitted.
+
+  # Not a StandardError (an Interrupt, what Timeout.timeout unwinds with),
+  # and one that is (Timeout.timeout with a class of the caller's, Thread#raise).
+  def interruptions
+    [Class.new(Exception), Class.new(StandardError)] # rubocop:disable Lint/InheritException
+  end
+
+  # The session that held the transaction is gone — the socket closed, so
+  # the server has dropped it — and the next statement runs on a new one.
+  def assert_session_dropped(srv, conn, what)
+    refute conn.usable?, what
+    assert_hung_up srv, 1, what
+    assert_equal 1, srv.connections, what
+    assert_equal 1, conn.exec("SELECT 1")[0]["c"], what
+    assert_equal 2, srv.connections, what
+  end
+
+  def test_an_exception_that_lands_just_after_begins_reply_leaves_no_transaction_open
+    interruptions.each do |interrupt|
+      what = "cut short by a #{interrupt.superclass}"
+      with_server do |srv|
+        srv.handler = FakeSkaidb.scripted(script)
+        c = connect(srv)
+        ran = false
+        assert_raises(interrupt, what) { cut_after_the_reply(c, interrupt) { c.transaction { |_tx| ran = true } } }
+        refute ran, what
+        # BEGIN was answered, and nothing has rolled the transaction back
+        assert_equal ["BEGIN"], statements(srv), what
+        assert_session_dropped srv, c, what
+        # the statement after it is in autocommit, not in that transaction
+        assert_equal ["BEGIN", "SELECT 1"], statements(srv), what
+        c.close
+      end
+    end
+  end
+
+  def test_an_exception_that_lands_just_before_commit_is_sent_leaves_no_transaction_open
+    interruptions.each do |interrupt|
+      what = "cut short by a #{interrupt.superclass}"
+      with_server do |srv|
+        srv.handler = FakeSkaidb.scripted(script)
+        c = connect(srv)
+        assert_raises(interrupt, what) do
+          cut_before_the_request(c, "COMMIT", interrupt) { c.transaction { |tx| tx.exec(DEBIT) } }
+        end
+        # the block ran to its end, so nothing rolled back; and COMMIT never left
+        assert_equal ["BEGIN", DEBIT], statements(srv), what
+        assert_session_dropped srv, c, what
+        c.close
+      end
+    end
+  end
+
+  def test_an_exception_that_lands_just_after_the_reply_to_a_retried_begin_leaves_none_open_either
+    interrupt = Class.new(Exception) # rubocop:disable Lint/InheritException
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(script("COMMIT" => F.error(CONFLICT)))
+      c = connect(srv)
+      runs = 0
+      trace = TracePoint.new(:return) do |tp|
+        # the reply to the second BEGIN — the one the retry sends — has been read
+        next unless tp.method_id == :round_trip && tp.self.equal?(c) && statements(srv).count("BEGIN") == 2
+
+        trace.disable
+        raise interrupt
+      end
+      assert_raises(interrupt) { trace.enable { c.transaction { |tx| (runs += 1) && tx.exec(DEBIT) } } }
+      assert_equal 1, runs
+      assert_equal ["BEGIN", DEBIT, "COMMIT", "BEGIN"], statements(srv)
+      assert_session_dropped srv, c, "the second attempt's BEGIN"
+      c.close
+    end
+  end
+
+  def test_pool_transaction_does_not_take_back_a_connection_left_with_a_transaction_open
+    interrupt = Class.new(Exception) # rubocop:disable Lint/InheritException
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(script)
+      pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret")
+      held = pool.checkout
+      pool.checkin(held)
+      assert_raises(interrupt) { cut_after_the_reply(held, interrupt) { pool.transaction { |_conn| flunk "not reached" } } }
+      assert held.finished?
+      assert_hung_up srv, 1
+      assert_equal [0, 0], pool.members[0].values_at(:in_use, :idle)
+      # the next borrower gets a connection of its own, in autocommit
+      assert_equal 1, pool.with { |conn| conn.exec("SELECT 1")[0]["c"] }
+      assert_equal ["BEGIN", "SELECT 1"], statements(srv)
+      assert_equal 2, srv.connections
+      pool.close
+    end
+  end
+
   def test_a_refused_begin_never_runs_the_block_and_sends_nothing_else
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted(script("BEGIN" => F.error("BEGIN refused")))
