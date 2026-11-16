@@ -12,7 +12,7 @@ Everything lives under the `Skaidb` module in `lib/skaidb.rb`.
 | `password` | `""` | SCRAM password. Empty skips server-signature verification (anonymous connect). |
 | `consistency` | `:quorum` | Default level for every statement: `:one`, `:quorum`, `:all`, `"ONE"`…, or `0`/`1`/`2`. |
 | `timeout` | `10.0` | TCP connect timeout in seconds; `nil` for none. Reads are not bounded. |
-| `database` | `nil` | Runs `USE "<database>"` after the handshake. Every re-dial re-enters the session's database: this one, or the one a later `USE` statement moved the session to. |
+| `database` | `nil` | Runs `USE "<database>"` after the handshake. Every re-dial re-enters the session's database: this one, or the one a later `USE` statement moved the session to — and sends the session's `SET CONSISTENCY` / `SET SCAN BUDGET` again (see [Reconnect](#reconnect)). |
 | `seeds` | `nil` | `["host", "host:port", …]`, tried in random order until one connects **and** authenticates. |
 | `tls` | `false` | Enable TLS with the system trust store. |
 | `tls_ca` | `nil` | PEM file to trust instead of the system store; implies `tls`. |
@@ -226,7 +226,8 @@ A broken connection's next
 `exec`/`exec_params`/`exec_batch`/`exec_prepared`/`stream`
 re-dials across the original seeds (a pooled connection: in the pool's
 order, usable members first and the one it lost last), re-authenticates,
-re-sends `Hello`, re-enters the session's database, and starts with an empty
+re-sends `Hello`, re-enters the session's database, sends the session's
+settings again, and starts with an empty
 prepared-statement cache. The database is the one the session was last in:
 `database:`, or the name of the last `USE [DATABASE] <name>` statement the
 server accepted from `exec`, `query`, `exec_params` or `stream` (the name
@@ -234,7 +235,22 @@ bare or double-quoted, an optional trailing `;`, `--` comments skipped as
 the server skips them; the name is kept as it was written and sent again
 in a `USE` of its own). It is entered before anything else is sent, and a refusal is
 raised to the statement that caused the re-dial — which is not sent — so no
-statement runs in another database. If the re-dial fails, that statement
+statement runs in another database.
+
+The settings are the last `SET CONSISTENCY …` and the last
+`SET SCAN BUDGET …` statement the server accepted (from the same four
+calls; one note per kind, the statement kept as written without its `--`
+comments). They are sent after the database and before the statement, in
+that order, each only when one is in force: `SET CONSISTENCY DEFAULT` and
+`SET SCAN BUDGET DEFAULT` clear the note, and nothing is sent for a setting
+that was never made. A setting the new session refuses is raised to the
+statement that caused the re-dial, which is not sent: no statement runs at
+another consistency, or without the scan limit the application set. Text
+that is not exactly one such statement is not followed. (`consistency=` is
+not a session setting: it is the level each request carries, and needs no
+restoring.)
+
+If the re-dial fails, that statement
 raises `ConnectionError` and the
 one after it tries again. Inside a transaction — the helper's, or one
 opened with a `BEGIN` statement — there is no re-dial: the transaction

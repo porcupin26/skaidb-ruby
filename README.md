@@ -164,6 +164,13 @@ entered before anything else is sent on the new socket, and if the server
 refuses it the statement raises that error instead of running in another
 database.
 
+Session settings come back with it. The last `SET CONSISTENCY …` and the
+last `SET SCAN BUDGET …` the server accepted are sent again on the new
+socket, after the database and before the statement; one cleared with
+`… DEFAULT` is not. If the server refuses a setting there, the statement
+raises that error: it never runs under other settings than the ones you
+set.
+
 ### Timeout
 
 `timeout` bounds the TCP dial only. Reads have no deadline: a peer that is
@@ -217,6 +224,13 @@ conn.stream("SELECT …", consistency: :one) { |row| … }
 `Skaidb::Consistency.resolve` accepts a Symbol, a String (any case) or the
 integer and raises `Skaidb::Error` otherwise. DDL is always run at quorum by
 the server regardless of this setting.
+
+These are the level each request carries. A `SET CONSISTENCY { ONE | QUORUM
+| ALL }` statement is something else: it makes the server run every
+statement of the session at that level whatever the request says, until
+`SET CONSISTENCY DEFAULT` (server ≥ 0.349). The driver follows it, and
+`SET SCAN BUDGET`, across re-dials — see
+[Seeds and failover](#seeds-and-failover).
 
 ### Health
 

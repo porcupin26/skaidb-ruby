@@ -815,6 +815,13 @@ module Skaidb
       # — a USE statement the server accepted moves it (see following).
       @dial_use = database.to_s.empty? ? nil : %("#{database.to_s.gsub('"', '""')}")
       @session_use = @dial_use
+      # The session's settings, as the statements every dial sends again
+      # after the database: the last SET CONSISTENCY and the last SET SCAN
+      # BUDGET the server accepted, nil when none is in force (never set, or
+      # cleared with DEFAULT). They live on the server's session like the
+      # database does: a new connection starts without them.
+      @session_consistency = nil
+      @session_scan_budget = nil
       # Retained so a reconnect repeats the original connect exactly.
       @dial_args = { host: host, port: port, user: user, password: password,
                      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
@@ -894,11 +901,32 @@ module Skaidb
               "no reachable endpoint in #{endpoints.map { |(h, q)| "#{h}:#{q}" }.join(', ')}: #{last.message}"
       end
       send_hello
-      # The database is per-connection session state, so it is entered on
-      # every dial — the one the session was last in, before anything else
-      # is sent. If the server refuses, the dial has failed and its error is
-      # the statement's: nothing runs in another database.
-      exec("USE #{@session_use}") if @session_use
+      restore_session
+    end
+
+    # What a session is besides its socket, put back on a new one before
+    # anything else is sent: the database the session was last in, then the
+    # consistency override, then the scan budget — each only when one is
+    # noted (see following). A new connection starts in the default database
+    # with neither setting, so without this the statement that follows a
+    # member's restart would read another database's table of the same
+    # name, at the request's own consistency, with the scan limit the
+    # application had set silently gone.
+    #
+    # If the server refuses one of them the dial has failed, and its error
+    # is the statement's: nothing runs in another database, or under other
+    # settings than the application set.
+    def restore_session
+      session_statement("USE #{@session_use}") if @session_use
+      session_statement(@session_consistency) if @session_consistency
+      session_statement(@session_scan_budget) if @session_scan_budget
+    end
+
+    # One statement of a dial's own, on the socket just dialled: sent as it
+    # is, with nothing looked at before it and nothing noted after it.
+    def session_statement(sql)
+      sql_bytes = sql.dup.force_encoding("UTF-8").b
+      parse_response(request([1, @consistency].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes))
     end
 
     # Best-effort self-identification: fills the server's +drivers+ table
@@ -1239,8 +1267,9 @@ module Skaidb
       # Built before anything touches the socket, so a parameter that cannot
       # be bound is refused without a round trip (or a re-dial).
       req = stream_request(sql, params, level)
-      # A statement that changes the session (USE, BEGIN, COMMIT, ROLLBACK)
-      # is followed here as it is from exec. One with parameters is none.
+      # A statement that changes the session (USE, SET CONSISTENCY, SET
+      # SCAN BUDGET, BEGIN, COMMIT, ROLLBACK) is followed here as it is
+      # from exec. One with parameters is none.
       change = params.empty? ? session_change(sql.to_s) : nil
       ended = end_lost_transaction(change)
       return ended if ended
@@ -1896,11 +1925,18 @@ module Skaidb
     # Exactly +COMMIT [TRANSACTION]+ or +ROLLBACK [TRANSACTION]+, with an
     # optional +;+.
     END_STATEMENT = /\A\s*(COMMIT|ROLLBACK)(?:\s+TRANSACTION)?\s*;?\s*\z/i.freeze
+    # One statement whose first words are +SET CONSISTENCY+, or +SET SCAN
+    # BUDGET+, with an optional +;+ (a second +;+ would be a second
+    # statement). What follows the keywords is the server's to read — but
+    # for +DEFAULT+, which clears the setting.
+    SET_STATEMENT = /\A\s*(SET\s+(CONSISTENCY|SCAN\s+BUDGET)(?![[:alnum:]_])[^;]*?)\s*;?\s*\z/i.freeze
+    SET_DEFAULT = /\ASET\s+(?:CONSISTENCY|SCAN\s+BUDGET)\s+DEFAULT(?![[:alnum:]_])/i.freeze
     # A +--+ comment, which the server skips to the end of its line — or a
     # double-quoted name or single-quoted string, inside which two dashes are
     # not a comment (an unclosed quote runs to the end of the text).
     COMMENT_OR_QUOTED = /"[^"]*(?:"|\z)|'[^']*(?:'|\z)|--[^\n]*/.freeze
-    private_constant :USE_STATEMENT, :BEGIN_STATEMENT, :END_STATEMENT, :COMMENT_OR_QUOTED
+    private_constant :USE_STATEMENT, :BEGIN_STATEMENT, :END_STATEMENT, :SET_STATEMENT, :SET_DEFAULT,
+                     :COMMENT_OR_QUOTED
 
     # What +sql+ changes of the session state the driver keeps a note of,
     # as [kind, value] — or nil, for every other statement and for text
@@ -1908,6 +1944,10 @@ module Skaidb
     #
     # - [:use, name] — +USE [DATABASE] <name>+: the session moves to that
     #   database. The name is kept as it was written.
+    # - [:consistency, statement], [:scan_budget, statement] — +SET
+    #   CONSISTENCY …+, +SET SCAN BUDGET …+: the statement is the setting in
+    #   force from now on, kept as written without its comments; nil when
+    #   it is +… DEFAULT+, which clears the setting.
     # - [:begin, nil] — a statement whose first word is +BEGIN+: a
     #   transaction opens.
     # - [:commit, nil], [:rollback, nil] — it ends.
@@ -1918,6 +1958,8 @@ module Skaidb
     def session_change(sql)
       text = sql.gsub(COMMENT_OR_QUOTED) { |part| part.start_with?("--") ? "" : part }
       if (m = USE_STATEMENT.match(text)) then [:use, m[1]]
+      elsif (m = SET_STATEMENT.match(text))
+        [m[2].casecmp?("CONSISTENCY") ? :consistency : :scan_budget, SET_DEFAULT.match?(m[1]) ? nil : m[1]]
       elsif BEGIN_STATEMENT.match?(text) then [:begin, nil]
       elsif (m = END_STATEMENT.match(text)) then [m[1].downcase.to_sym, nil]
       end
@@ -1933,12 +1975,14 @@ module Skaidb
     # - Success: the change is noted. After USE the session is in that
     #   database, and a re-dial must put it back there (a new session starts
     #   in the default database, where a table of the same name is another
-    #   table). After BEGIN a transaction is open, and until it ends a lost
+    #   table); after a SET it has that setting, and a re-dial sends it
+    #   again (see restore_session). One note per kind: the last statement
+    #   the server accepted. After BEGIN a transaction is open, and until it ends a lost
     #   connection is not replaced: PROTOCOL.md §6 rule 7 holds for a
     #   transaction the application writes itself exactly as inside the
     #   helper. After COMMIT or ROLLBACK it is over.
-    # - An Error from the server (QueryError): a USE or a BEGIN it refused
-    #   changed nothing. A COMMIT it refused has ended the transaction all
+    # - An Error from the server (QueryError): a USE, a SET or a BEGIN it
+    #   refused changed nothing. A COMMIT it refused has ended the transaction all
     #   the same, and so has a ROLLBACK.
     # - No answer the driver could read — the connection lost under the
     #   statement, a reply that makes no sense, or an exception no statement
@@ -1960,6 +2004,8 @@ module Skaidb
         result = yield
         case kind
         when :use then @session_use = value
+        when :consistency then @session_consistency = value
+        when :scan_budget then @session_scan_budget = value
         when :begin then @transaction = true
         else @transaction = false
         end
