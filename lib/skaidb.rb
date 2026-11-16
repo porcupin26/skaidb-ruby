@@ -827,7 +827,8 @@ module Skaidb
         end
       end
       if last
-        @closed = true
+        # Not closed: this is also how a re-dial fails while the members are
+        # down, and the next statement dials again (see ensure_live!).
         raise ConnectionError,
               "no reachable endpoint in #{endpoints.map { |(h, q)| "#{h}:#{q}" }.join(', ')}: #{last.message}"
       end

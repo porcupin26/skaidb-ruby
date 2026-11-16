@@ -375,6 +375,27 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_re_dial_that_fails_is_tried_again_by_the_next_statement
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted("SELECT 1" => F.rows(["c"], [[1]]))
+      c = connect(srv)
+      srv.refuse = true # the server is down: its port accepts, then hangs up
+      srv.close_all
+      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } # meets the loss
+      2.times do
+        e = assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } # re-dials, in vain
+        assert_match(/no reachable endpoint/, e.message)
+      end
+      refute c.usable?
+      refute c.finished? # still down is not closed
+      srv.refuse = false # ... and it is back
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert c.usable?
+      c.close
+      assert c.finished?
+    end
+  end
+
   def test_a_round_trip_cut_short_retires_the_socket_instead_of_leaving_its_reply_to_the_next_statement
     interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with: not a StandardError
     calls = {
