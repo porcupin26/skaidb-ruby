@@ -150,7 +150,8 @@ use it meanwhile.
 
 - `consistency` / `consistency=` — the default level (`0`/`1`/`2`; the setter
   accepts anything `Consistency.resolve` does).
-- `usable?` — `false` once closed, once a transport error broke the socket
+- `usable?` — `false` once closed, once a transport error broke the socket,
+  a reply could not be read
   or a round trip was cut short with its reply outstanding, or while a
   stream is in flight (including one abandoned through external iteration).
   No round-trip.
@@ -163,7 +164,11 @@ use it meanwhile.
 ### Reconnect
 
 A transport failure raises `Skaidb::ConnectionError` and marks the
-connection broken. A statement cut short between its request and its reply
+connection broken. So does a reply that cannot be read — a tag the protocol
+does not have, a message shorter than its own fields say — whichever call
+it answers: what follows it on the socket cannot be placed. (A reply of the
+wrong kind to a prepare or to a stream request is raised as `QueryError`;
+the connection is marked broken all the same.) A statement cut short between its request and its reply
 by anything else (an `Interrupt`, `Timeout.timeout`, `Thread#kill`) marks it
 broken too, since that reply is still on its way; the exception propagates
 as it is. A connection marked broken closes its socket there and then, so

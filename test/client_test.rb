@@ -327,6 +327,118 @@ class ClientTest < Minitest::Test
     end
   end
 
+  # ---- a reply that cannot be read -----------------------------------------
+  #
+  # A tag the protocol does not have, or a message shorter than its own
+  # fields say: the peer is not speaking the protocol, and what follows on
+  # the socket cannot be placed. Such a connection carries nothing more.
+
+  ONE = "SELECT 1"
+  ONE_ROW = F.rows(["c"], [[1]])
+
+  # The connection is retired — not usable, its socket closed at once — and
+  # the next statement runs on a new one.
+  def assert_dropped(srv, conn, what)
+    refute conn.usable?, what
+    assert_hung_up srv, 1, what
+    assert_equal 1, srv.connections, what
+    assert_equal 1, conn.exec(ONE)[0]["c"], what
+    assert_equal 2, srv.connections, what
+    assert conn.usable?, what
+  end
+
+  def test_a_reply_that_cannot_be_read_drops_the_connection
+    rows = F.rows(%w[id name], [[1, "Ada"]])
+    bad_value = [0].pack("C") + [1].pack("V") + F.str("c") + [1].pack("V") + [1].pack("V") + [1].pack("V") + "\x63".b
+    replies = {
+      "an unknown response tag" => "\x09".b,
+      "an empty frame" => "".b,
+      "Rows cut short" => rows[0, rows.bytesize - 3],
+      "a Mutation cut short" => F.mutation(1)[0, 5],
+      "an Error cut short" => F.error("no such table")[0, 9],
+      "ResultSets cut short" => F.result_sets([[%w[a], [[1]]]])[0, 7],
+      "a value of an unknown type" => bad_value
+    }
+    calls = {
+      "exec" => ->(c) { c.exec("SELECT x") },
+      "exec_params, sent as text" => ->(c) { c.exec_params("SELECT x") },
+      "exec_params, prepared" => ->(c) { c.exec_params("SELECT $1", [1]) },
+      "exec_prepared" => ->(c) { c.exec_prepared(c.prepare_server("SELECT ?")[0], [1], 1) },
+      "exec_batch" => ->(c) { c.exec_batch("SELECT $1", [[1], [2]]) }
+    }
+    replies.to_a.product(calls.to_a).each do |(reply_name, reply), (call_name, call)|
+      what = "#{reply_name}, answering #{call_name}"
+      with_server do |srv|
+        srv.handler = FakeSkaidb.scripted(
+          { "SELECT x" => reply, ONE => ONE_ROW },
+          prepared: { "SELECT ?" => 1 }, on_execute: ->(_s, _req) { reply }, on_batch: ->(_s, _req) { reply }
+        )
+        c = connect(srv)
+        assert_raises(Skaidb::ConnectionError, what) { call.call(c) }
+        assert_dropped srv, c, what
+        c.close
+      end
+    end
+  end
+
+  def test_a_prepare_reply_that_cannot_be_read_drops_the_connection
+    replies = {
+      "an unknown response tag" => ["\x09".b, Skaidb::QueryError],
+      "an empty frame" => ["".b, Skaidb::ConnectionError],
+      "Prepared cut short" => [F.prepared(7, 1)[0, 4], Skaidb::ConnectionError],
+      "an Error cut short" => [F.error("cannot prepare this statement")[0, 9], Skaidb::ConnectionError]
+    }
+    calls = {
+      "exec_params" => ->(c) { c.exec_params("SELECT $1", [1]) },
+      "exec_batch" => ->(c) { c.exec_batch("SELECT $1", [[1]]) },
+      "prepare_server" => ->(c) { c.prepare_server("SELECT ?") }
+    }
+    replies.to_a.product(calls.to_a).each do |(reply_name, (reply, error)), (call_name, call)|
+      what = "#{reply_name}, answering the prepare of #{call_name}"
+      with_server do |srv|
+        srv.handler = ->(req, _conn) { req.op == 2 ? reply : (req.op == 1 ? ONE_ROW : nil) }
+        c = connect(srv)
+        assert_raises(error, what) { call.call(c) }
+        assert_dropped srv, c, what
+        c.close
+      end
+    end
+  end
+
+  def test_a_stream_reply_that_cannot_be_read_drops_the_connection
+    header = F.header(%w[id name])
+    chunk = F.chunk([[1, "Ada"], [2, "Linus"]])
+    replies = {
+      "an unknown response tag" => ["\x09".b, Skaidb::QueryError],
+      "an empty frame" => ["".b, Skaidb::ConnectionError],
+      "a Mutation cut short" => [F.mutation(1)[0, 5], Skaidb::ConnectionError],
+      "an Error cut short" => [F.error("no such table")[0, 9], Skaidb::ConnectionError],
+      "ResultSets cut short" => [F.result_sets([[%w[a], [[1]]]])[0, 7], Skaidb::ConnectionError],
+      "a header cut short" => [[header[0, header.bytesize - 2], chunk, F.rows_end], Skaidb::ConnectionError],
+      # the frames after it are whole, so the reply's end could be found —
+      # by a peer that is not to be trusted with where it is
+      "a chunk cut short" => [[header, chunk[0, chunk.bytesize - 3], F.rows_end], Skaidb::ConnectionError],
+      "an empty frame after the header" => [[header, "".b, F.rows_end], Skaidb::ConnectionError],
+      "an Error cut short after a chunk" =>
+        [[header, chunk, F.error("scan budget exceeded")[0, 9], F.rows_end], Skaidb::ConnectionError]
+    }
+    calls = {
+      "stream" => ->(c) { c.stream("SELECT x") { |_row| nil } },
+      "stream, as an Enumerator" => ->(c) { c.stream("SELECT x").to_a },
+      "stream with parameters" => ->(c) { c.stream("SELECT x WHERE id > $1", [0]) { |_row| nil } }
+    }
+    replies.to_a.product(calls.to_a).each do |(reply_name, (reply, error)), (call_name, call)|
+      what = "#{reply_name}, answering #{call_name}"
+      with_server do |srv|
+        srv.handler = FakeSkaidb.scripted("SELECT x" => reply, "SELECT x WHERE id > ?" => reply, ONE => ONE_ROW)
+        c = connect(srv)
+        assert_raises(error, what) { call.call(c) }
+        assert_dropped srv, c, what
+        c.close
+      end
+    end
+  end
+
   def test_hello_refused_by_an_old_server_is_ignored
     with_server do |srv|
       srv.handler = ->(req, _c) { req.op == 8 ? F.error("unknown opcode 8") : F.rows(["c"], [[1]]) }

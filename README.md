@@ -213,8 +213,9 @@ the server regardless of this setting.
 ### Health
 
 - `conn.usable?` — no round-trip. `true` unless the connection is closed, was
-  left out of sync by a transport error, a round trip cut short or an
-  undrainable abandoned stream, or is currently mid-stream.
+  left out of sync by a transport error, a reply that could not be read, a
+  round trip cut short or an undrainable abandoned stream, or is currently
+  mid-stream.
 - `conn.closed` / `conn.finished?` — `true` after `close`.
 
 ## Statements and parameters
@@ -455,8 +456,10 @@ StandardError
   [Transactions](#transactions).
 - A transport failure (`ConnectionError`) marks the connection broken and
   closes its socket; the next statement re-dials, or a pool replaces it. So
-  does anything else that cuts a statement short between its request and its
-  reply (an `Interrupt`, a `Timeout`); that exception propagates as it is.
+  does a reply that cannot be read (a tag the protocol does not have, a
+  message shorter than its own fields say), and so does anything else that
+  cuts a statement short between its request and its reply (an `Interrupt`,
+  a `Timeout`); that exception propagates as it is.
 - `ArgumentError` for `Pool.new(maxsize: 0)` or an unknown
   `load_balancing`/`idle_order`, for `Skaidb::Uuid.new` of a string that
   is not a UUID, for `stream` parameters that are not an Array, and for

@@ -1196,18 +1196,19 @@ module Skaidb
           raise
         end
         @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
-        tag = r.u8
+        tag = reading_reply { r.u8 }
         note_statement(sql) unless tag == 3
         case tag
         when 3
-          msg = r.text
+          msg = reading_reply { r.text }
           if msg.include?("unknown opcode")
             what = params.empty? ? "streaming" : "parameterised streaming (skaidb >= 0.330)"
             raise QueryError, "server does not support #{what}: #{msg}"
           end
           raise Skaidb.statement_error(msg)
         when 1
-          return Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation) # not row-producing
+          affected = reading_reply { r.u64 }
+          return Result.new(fields: [], rows: [], cmd_tuples: affected, kind: :mutation) # not row-producing
         when 2
           note_use(sql.to_s) if params.empty?
           return Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
@@ -1216,7 +1217,7 @@ module Skaidb
           # in ONE frame, streamed or not — the frame exec receives, decoded
           # by the same code. Nothing follows it, so the rows are yielded
           # below, with the connection free.
-          sets = parse_result_sets(r)
+          sets = reading_reply { parse_result_sets(r) }
         when 5
           # The server has already committed to a row stream, so from here
           # the socket carries frames this call owns — mark it BEFORE
@@ -1232,27 +1233,29 @@ module Skaidb
           @streaming = true
           @stream_fiber = Fiber.current
           Skaidb.keep_stream_lock(@mutex)
-          cols = Array.new(r.u32) { r.text }
-          summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
           reading = false
           begin
+            # Inside the begin: a header that cannot be read leaves through
+            # the ensure below like every other way out of the stream.
+            cols = reading_reply { Array.new(r.u32) { r.text } }
+            summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
             while live
               reading = true
               frame = read_frame
               reading = false
               fr = Reader.new(frame)
-              case fr.u8
+              case reading_reply { fr.u8 }
               when 6
-                fr.u32.times do
-                  ncells = fr.u32
-                  cells = Array.new(ncells) { Skaidb.decode_value(Reader.new(fr.blob)) }
+                reading_reply { fr.u32 }.times do
+                  cells = reading_reply { Array.new(fr.u32) { Skaidb.decode_value(Reader.new(fr.blob)) } }
                   yield cols.zip(cells).to_h
                 end
               when 7
                 live = false
               when 3
+                msg = reading_reply { fr.text }
                 live = false
-                raise Skaidb.statement_error(fr.text)
+                raise Skaidb.statement_error(msg)
               else
                 # Mid-stream the server sends only RowsChunk, RowsEnd or Error.
                 # Anything else means we no longer know where the reply ends, so
@@ -1273,7 +1276,9 @@ module Skaidb
                 # server had sent the rest of the stream, which a stalled
                 # server never does.
                 mark_broken!
-              elsif live
+              elsif live && !@broken
+                # (A frame that could not be read has retired the socket
+                # already: there is no drain after it.)
                 drain_stream!
               end
             ensure
@@ -1289,6 +1294,9 @@ module Skaidb
             end
           end
         else
+          # Not a reply to a stream request: whether more frames follow it,
+          # and how many, cannot be told.
+          mark_broken!
           raise QueryError, "unexpected response tag #{tag} to stream request"
         end
       end
@@ -1622,15 +1630,15 @@ module Skaidb
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
       reader = request(req)
-      tag = reader.u8
+      tag = reading_reply { reader.u8 }
       case tag
       when 4
-        id = (@serial << 32) | reader.u32
-        nparams = reader.u16
+        number, nparams = reading_reply { [reader.u32, reader.u16] }
+        id = (@serial << 32) | number
         @handles[id] = sql if hold
         (hold ? @held : @prepared)[sql] = [id, nparams]
       when 3
-        msg = reader.text
+        msg = reading_reply { reader.text }
         raise Skaidb.statement_error(msg) if msg.start_with?("too many prepared statements")
 
         # Refused: DDL/session statements cannot be prepared, and an old
@@ -1638,6 +1646,7 @@ module Skaidb
         @last_prepare_error = msg
         nil
       else
+        mark_broken! # not a reply to a prepare: what follows it cannot be placed
         raise QueryError, "unexpected prepare response tag #{tag}"
       end
     end
@@ -1824,21 +1833,40 @@ module Skaidb
     end
 
     def parse_response(r)
-      tag = r.u8
-      case tag
-      when 0 # Rows
-        parse_rows(r)
-      when 8 # ResultSets: a CALL whose body EMITted
-        parse_result_sets(r)
-      when 1 # Mutation
-        Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation)
-      when 2 # Ddl
-        Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
-      when 3 # Error — a statement error, connection stays usable
-        raise Skaidb.statement_error(r.text)
-      else
-        raise ConnectionError, "unknown response tag #{tag}"
+      message = nil
+      result = reading_reply do
+        tag = r.u8
+        case tag
+        when 0 # Rows
+          parse_rows(r)
+        when 8 # ResultSets: a CALL whose body EMITted
+          parse_result_sets(r)
+        when 1 # Mutation
+          Result.new(fields: [], rows: [], cmd_tuples: r.u64, kind: :mutation)
+        when 2 # Ddl
+          Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
+        when 3 # Error — a statement error, connection stays usable
+          message = r.text
+        else
+          raise ConnectionError, "unknown response tag #{tag}"
+        end
       end
+      raise Skaidb.statement_error(message) if message
+
+      result
+    end
+
+    # Runs the block that reads a reply's fields. A reply that cannot be
+    # read — a tag the protocol does not have, a message shorter than its
+    # own fields say, a value of an unknown type — is a ConnectionError, and
+    # the connection is marked broken with it: the peer is not speaking the
+    # protocol, so where its reply ends, and what the next bytes on the
+    # socket belong to, cannot be told. The next statement re-dials.
+    def reading_reply
+      yield
+    rescue ConnectionError
+      mark_broken!
+      raise
     end
 
     # A Rows body (PROTOCOL.md §3.2), also one set of ResultSets; +r+ sits
