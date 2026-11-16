@@ -740,7 +740,8 @@ module Skaidb
       end
       @mutex = Mutex.new
       @closed = false
-      # Transport died; the next statement re-dials (see ensure_live!).
+      # Transport died, and its socket is closed (see mark_broken!); the next
+      # statement re-dials (see ensure_live!).
       @broken = false
       # A stream is in flight, so the socket sits mid-reply (see stream).
       @streaming = false
@@ -996,7 +997,8 @@ module Skaidb
     #   ConnectionError instead of autocommitting on a new session. The same
     #   goes for a block cut short in the middle of a round trip (an
     #   Interrupt, a Timeout): the reply is still on its way, so nothing more
-    #   is written to that socket.
+    #   is written to that socket. Either way the socket is closed at once,
+    #   and the server drops the transaction with it.
     #
     # The whole transaction runs on this one connection, so no other thread
     # may use it meanwhile. +attempts+ below 1, or no block, is an
@@ -1169,7 +1171,7 @@ module Skaidb
                 # Anything else means we no longer know where the reply ends, so
                 # there is no draining back to a request boundary: retire it.
                 live = false
-                @broken = true
+                mark_broken!
                 raise QueryError, "unexpected frame in stream"
               end
             end
@@ -1309,8 +1311,24 @@ module Skaidb
       payload = payload.b
       @sock.write([payload.bytesize].pack("N") + payload) # length is BE
     rescue StandardError => e
-      @broken = true
+      mark_broken!
       raise ConnectionError, "write failed: #{e.message}"
+    end
+
+    # This socket carries no further statement: its transport failed, or it
+    # was left in the middle of a reply. usable? turns false and the next
+    # statement re-dials — and the socket is closed HERE, not when that
+    # statement comes. The server keeps a session for as long as its socket
+    # is open, and with it the transaction left open on it; a connection that
+    # timed out inside a transaction and is not used again would hold that
+    # transaction until it is closed or collected. The TCP socket is closed
+    # as it is, with no TLS goodbye written first: nothing more is written
+    # to a socket in this state.
+    def mark_broken!
+      @broken = true
+      @sock&.to_io&.close
+    rescue StandardError
+      nil
     end
 
     # Re-dial if the transport died since the last statement, BEFORE anything
@@ -1377,13 +1395,13 @@ module Skaidb
         break if tag == 7 || tag == 3 # RowsEnd, or an Error that ended the stream
         next if tag == 6              # RowsChunk: more to come
 
-        @broken = true
+        mark_broken!
         break
       end
     rescue StandardError
-      # An I/O failure already set @broken in read_exact; set it for the rest
+      # An I/O failure already marked it in read_exact; mark it for the rest
       # (a truncated frame, say) so the socket is never reused mid-reply.
-      @broken = true
+      mark_broken!
     end
 
     def read_exact(n)
@@ -1394,11 +1412,11 @@ module Skaidb
         chunk = begin
           @sock.read(n - buf.bytesize)
         rescue StandardError => e
-          @broken = true
+          mark_broken!
           raise ConnectionError, "read failed: #{e.message}"
         end
         if chunk.nil? || chunk.empty?
-          @broken = true
+          mark_broken!
           raise ConnectionError, "connection closed by server"
         end
 
@@ -1523,8 +1541,8 @@ module Skaidb
     # Interrupt, a Timeout or Thread#kill, which no rescue here sees — means
     # the reply is still on its way: the socket no longer sits at a request
     # boundary, and the next statement would read this one's reply as its
-    # own. So the connection is marked broken: usable? turns false, a pool
-    # drops it, and the next statement re-dials.
+    # own. So the connection is marked broken and its socket closed: usable?
+    # turns false, a pool drops it, and the next statement re-dials.
     def round_trip(req)
       answered = false
       write_frame(req)
@@ -1532,7 +1550,7 @@ module Skaidb
       answered = true
       frame
     ensure
-      @broken = true unless answered
+      mark_broken! unless answered
     end
 
     def observe_failure

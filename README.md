@@ -159,6 +159,9 @@ not take the connection's lock, so another thread can break a stuck read by
 closing the connection. A statement cut short while its reply is outstanding
 — by `Timeout.timeout`, an `Interrupt`, `Thread#kill` — leaves the connection
 marked broken, so the next statement re-dials instead of reading that reply.
+A connection marked broken closes its socket there and then: the server
+drops the session, and a transaction open on it, without waiting for that
+next statement.
 
 ### TLS
 
@@ -441,10 +444,10 @@ StandardError
   `TransactionConflict`, from every call that runs a statement. It is a
   `QueryError`, so `rescue Skaidb::QueryError` catches it too; see
   [Transactions](#transactions).
-- A transport failure (`ConnectionError`) marks the connection broken; the
-  next statement re-dials, or a pool replaces it. So does anything else that
-  cuts a statement short between its request and its reply (an `Interrupt`,
-  a `Timeout`); that exception propagates as it is.
+- A transport failure (`ConnectionError`) marks the connection broken and
+  closes its socket; the next statement re-dials, or a pool replaces it. So
+  does anything else that cuts a statement short between its request and its
+  reply (an `Interrupt`, a `Timeout`); that exception propagates as it is.
 - `ArgumentError` for `Pool.new(maxsize: 0)` or an unknown
   `load_balancing`/`idle_order`, for `Skaidb::Uuid.new` of a string that
   is not a UUID, for `stream` parameters that are not an Array, and for
@@ -501,7 +504,9 @@ What else `transaction` does:
   block still runs after rescuing the failure raises `ConnectionError`
   instead of running on a new session. The same goes for a block cut short
   in the middle of a round trip (an `Interrupt`, a `Timeout`): the reply is
-  still on its way, so nothing more is written to that socket.
+  still on its way, so nothing more is written to that socket. Either way
+  the socket is closed at once, and the server drops the transaction with
+  it.
 - `pool.transaction(attempts: 3, begin: "BEGIN", affinity: nil)` checks one
   connection out, runs every attempt on it, and returns it afterwards.
 

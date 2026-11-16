@@ -5,6 +5,7 @@
 # Connection#transaction / Pool#transaction helper — asserted by the
 # statements the fake server received.
 require "test_helper"
+require "timeout"
 
 class TransactionTest < Minitest::Test
   include ServerHelpers
@@ -324,6 +325,7 @@ class TransactionTest < Minitest::Test
       assert_equal ["BEGIN", DEBIT], statements(srv) # no ROLLBACK, no COMMIT
       assert_equal 1, srv.connections                # and no re-dial inside the helper
       gate << true
+      assert_hung_up srv, 1 # the socket is closed, and the server's transaction with it
       # the next statement runs on a new socket and reads its own reply
       assert_equal 1, c.exec("SELECT 1")[0]["c"]
       assert_equal 2, srv.connections
@@ -665,6 +667,53 @@ class TransactionTest < Minitest::Test
       assert_equal 3, srv.connections
       assert_equal [0, 1], pool.members[0].values_at(:in_use, :idle)
       pool.close
+    end
+  end
+
+  # ---- a broken connection lets go of its socket ---------------------------
+  #
+  # The server keeps a session, the transaction open on it and the rows that
+  # transaction claimed for as long as the socket is open.
+
+  def test_a_connection_that_breaks_inside_a_transaction_closes_its_socket_at_once
+    with_server do |srv|
+      # the server stops sending and keeps the session
+      srv.handler = FakeSkaidb.scripted(script(DEBIT => :half_close))
+      c = connect(srv)
+      e = assert_raises(Skaidb::ConnectionError) do
+        c.transaction do |tx|
+          assert_raises(Skaidb::ConnectionError) { tx.exec(DEBIT) }
+          # while the block is still running — not at the connection's next
+          # statement after the helper, or at its close
+          assert_hung_up srv, 1
+          tx.exec(CREDIT)
+        end
+      end
+      assert_match(/lost inside a transaction/, e.message)
+      assert_equal ["BEGIN", DEBIT], statements(srv)
+      assert_equal 1, srv.connections
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 2, srv.connections
+      c.close
+    end
+  end
+
+  def test_a_block_that_times_out_in_a_round_trip_closes_its_socket_at_once
+    with_server do |srv|
+      gate = Queue.new
+      srv.handler = FakeSkaidb.scripted(script(DEBIT => ->(_req, _conn) { gate.pop && F.mutation(1) }))
+      c = connect(srv)
+      assert_raises(Timeout::Error) { Timeout.timeout(0.2) { c.transaction { |tx| tx.exec(DEBIT) } } }
+      refute c.usable?
+      gate << true
+      # the client's read timeout is not the server's: the session is alive
+      # there, and its transaction open, until the socket closes
+      assert_hung_up srv, 1
+      assert_equal ["BEGIN", DEBIT], statements(srv) # no ROLLBACK, no COMMIT
+      assert_equal 1, srv.connections
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 2, srv.connections
+      c.close
     end
   end
 

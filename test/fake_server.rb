@@ -133,21 +133,27 @@ module FakeSkaidb
   class Server
     ITERATIONS = 1000
 
-    attr_reader :port, :requests, :hellos, :connections
+    attr_reader :port, :requests, :hellos, :connections, :hangups
     attr_accessor :corrupt_server_signature, :handler, :refuse
 
     # password: the one password every user has.
-    # handler: ->(req, conn) { payload | [payloads] | :close | nil } for every
-    #   post-handshake request; Hello is answered with Ddl unless the handler
-    #   returns something; nil for anything else answers Error.
+    # handler: ->(req, conn) { payload | [payloads] | :close | :half_close | nil }
+    #   for every post-handshake request; Hello is answered with Ddl unless
+    #   the handler returns something; nil for anything else answers Error.
+    #   :close drops the connection instead of answering; :half_close stops
+    #   sending (the client reads end-of-file) while the server keeps the
+    #   session and goes on reading, as a peer that only shut down its side.
     # refuse (attribute): while true, each new connection is closed before
     #   the handshake — a node that is down while its port still accepts.
+    # hangups: the connections the CLIENT ended — it closed its socket while
+    #   the server still held the session (and whatever was open on it).
     def initialize(password: "secret", &handler)
       @password = password
       @handler = handler || ->(_req, _conn) { nil }
       @requests = []
       @hellos = []
       @connections = 0
+      @hangups = 0
       @sockets = []
       @threads = []
       @mutex = Mutex.new
@@ -223,15 +229,28 @@ module FakeSkaidb
         out = @handler.call(req, conn)
         if out == :close
           sock.close
-          break
+          return
+        end
+        if out == :half_close
+          sock.close_write
+          next
         end
         out = (req.op == 8 ? F.ddl : F.error("fake server: unhandled op #{req.op}")) if out.nil?
         Array(out).each { |p| send(sock, p) }
       end
+      hung_up(sock) # end-of-file where a request would start
+    rescue Errno::ECONNRESET, Errno::EPIPE
+      hung_up(sock) # gone with a reply still on its way to it
     rescue IOError, SystemCallError
       nil
     ensure
       sock.close rescue nil
+    end
+
+    # The client closed its socket — unless the server closed it first
+    # (close_all, stop), which is no hang-up.
+    def hung_up(sock)
+      @mutex.synchronize { @hangups += 1 if @sockets.delete(sock) }
     end
 
     def handshake(sock, conn)

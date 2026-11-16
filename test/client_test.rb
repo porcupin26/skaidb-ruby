@@ -5,6 +5,7 @@
 # (including the abandon/drain rule), multi-set replies, failover, reconnect,
 # the session database, the pool and subscribe().
 require "test_helper"
+require "timeout"
 
 class ClientTest < Minitest::Test
   include ServerHelpers
@@ -220,6 +221,53 @@ class ClientTest < Minitest::Test
       e = assert_raises(Skaidb::QueryError) { c.stream("SELECT weird") { |_| nil } }
       assert_match(/unexpected frame/, e.message)
       refute c.usable?
+      assert_hung_up srv, 1 # and its socket is closed there and then
+      c.close
+    end
+  end
+
+  def test_a_connection_marked_broken_closes_its_socket_at_once
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(
+        # the server stops sending and keeps the session
+        "SELECT lost" => :half_close,
+        # a stream whose rest cannot be drained: an unexpected frame follows
+        "SELECT weird" => [F.header(["id"]), F.chunk([[1]]), F.ddl],
+        "SELECT 1" => F.rows(["c"], [[1]])
+      )
+      c = connect(srv)
+      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT lost") }
+      refute c.usable?
+      # the server is not left holding the session until this connection's
+      # next statement, or its close
+      assert_hung_up srv, 1
+      assert_equal 1, srv.connections
+      assert_equal 1, c.exec("SELECT 1")[0]["c"] # re-dialled
+      c.stream("SELECT weird") { |_row| break } # the drain gives up on the frame
+      refute c.usable?
+      assert_hung_up srv, 2
+      assert_equal 2, srv.connections
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 3, srv.connections
+      c.close
+    end
+  end
+
+  def test_a_statement_that_times_out_closes_its_socket_at_once
+    with_server do |srv|
+      gate = Queue.new
+      srv.handler = FakeSkaidb.scripted(
+        "SELECT slow" => ->(_req, _conn) { gate.pop && F.rows(["c"], [["slow"]]) },
+        "SELECT 1" => F.rows(["c"], [[1]])
+      )
+      c = connect(srv)
+      assert_raises(Timeout::Error) { Timeout.timeout(0.2) { c.exec("SELECT slow") } }
+      refute c.usable?
+      gate << true
+      assert_hung_up srv, 1
+      assert_equal 1, srv.connections
+      assert_equal 1, c.exec("SELECT 1")[0]["c"] # its own reply, on a new socket
+      assert_equal 2, srv.connections
       c.close
     end
   end
@@ -364,7 +412,8 @@ class ClientTest < Minitest::Test
         end
         # no transport error happened, yet the socket is no longer at a request boundary
         refute c.usable?, what
-        gate << true # the late reply now arrives on the old socket
+        gate << true # the late reply finds the old socket closed
+        assert_hung_up srv, 1, what
         # the next statement reads its own reply, on a new socket — a cached
         # prepared statement included (prepared again there)
         assert_equal 8, c.exec_params("SELECT $1", [8])[0]["p"], what

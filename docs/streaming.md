@@ -103,8 +103,8 @@ Two things defeat the drain:
   it out again. Iterate with a block or `each`.
 - **A frame that makes no sense mid-stream**, or a dead socket. The driver
   no longer knows where the reply ends, so it marks the connection broken
-  instead of guessing; `usable?` turns `false`, and the next statement
-  re-dials.
+  and closes the socket instead of guessing; `usable?` turns `false`, and
+  the next statement re-dials.
 
 There is no read deadline: a peer that is alive but silent blocks the drain,
 holding the lock. `close` does not take the lock, so another thread can break

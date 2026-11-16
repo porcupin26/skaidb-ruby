@@ -20,6 +20,14 @@ module ServerHelpers
     Skaidb.connect(**{ host: "127.0.0.1", port: srv.port, user: "ada", password: "secret" }.merge(kw))
   end
 
+  # The client has closed +count+ of its sockets while the server still held
+  # their sessions (waits up to +secs+ for the server to see it).
+  def assert_hung_up(srv, count, msg = nil, secs = 2)
+    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    sleep 0.005 while srv.hangups < count && Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0 < secs
+    assert_equal count, srv.hangups, msg || "sockets the client has closed"
+  end
+
   # Wait (up to +secs+) until the block is true.
   def until_true(secs = 2)
     t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)

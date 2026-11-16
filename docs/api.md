@@ -113,7 +113,8 @@ yields the connection, then sends `COMMIT`.
 - A block cut short in the middle of a round trip (an `Interrupt`, a
   `Timeout`, `Thread#kill`) leaves a reply on its way, so the connection is
   not `usable?` and nothing more is written to it: no `ROLLBACK`. The
-  transaction ends with that socket, which the next statement after
+  transaction ends with that socket, which is closed at once — the server
+  drops the transaction with it — and which the next statement after
   `transaction` replaces.
 - Raises `ArgumentError`, before anything is sent, when `attempts` is not an
   Integer ≥ 1 or no block is given.
@@ -141,7 +142,10 @@ A transport failure raises `Skaidb::ConnectionError` and marks the
 connection broken. A statement cut short between its request and its reply
 by anything else (an `Interrupt`, `Timeout.timeout`, `Thread#kill`) marks it
 broken too, since that reply is still on its way; the exception propagates
-as it is. The next `exec`/`exec_params`/`exec_batch`/`stream`
+as it is. A connection marked broken closes its socket there and then, so
+the server drops the session — and a transaction left open on it — without
+waiting for the connection's next statement or its `close`. The next
+`exec`/`exec_params`/`exec_batch`/`stream`
 re-dials across the original seeds (a pooled connection: in the pool's
 order, usable members first and the one it lost last), re-authenticates,
 re-sends `Hello`, re-runs `USE`, and starts with an empty prepared-statement
