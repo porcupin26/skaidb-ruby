@@ -40,7 +40,7 @@ end
 module Skaidb
   # The package version — the single source of truth. The gemspec reads it,
   # and it is what the driver reports to the server in the Hello frame.
-  VERSION = "1.5.0"
+  VERSION = "1.5.1"
 
   # Base class for every error raised by this driver.
   class Error < StandardError; end

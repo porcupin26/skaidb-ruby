@@ -4,6 +4,79 @@ All notable changes to the skaidb Ruby driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-11-16
+
+### Fixed
+- **A connection marked broken closes its socket at once.** A connection
+  whose transport failed, or that was left in the middle of a reply
+  (`Timeout.timeout`, an `Interrupt`, `Thread#kill`), kept its socket open
+  until its next statement re-dialled or it was closed. The server keeps a
+  session for as long as its socket is open, so a statement that timed out
+  inside a transaction left that transaction open on the server until the
+  application came back to the connection. The socket is now closed when
+  the connection is marked broken.
+- **A stream the `transaction` block leaves open no longer leaves a
+  transaction to join.** A block that returned or raised with an Enumerator
+  from `stream` advanced by `next` and not read to its end left `COMMIT` and
+  `ROLLBACK` unable to be sent (`COMMIT` raised `ThreadError`), and the
+  transaction open; once the Enumerator was read to its end, every later
+  statement on the connection ran inside that transaction and was lost
+  with it. The helper now closes the socket — the server drops the
+  transaction — and ends the stream, so the next statement re-dials; a
+  block that ran to its end gets `ConnectionError`, one that was leaving
+  with an exception, `break` or `throw` leaves with that.
+- **The session database survives a re-dial when it was entered with a
+  `USE` statement.** Only `database:` was re-entered; after `USE app` sent
+  with `exec`, a re-dialled connection was in the default database, and its
+  statements ran against that database's tables of the same names. The
+  connection now follows the last `USE [DATABASE] <name>` the server
+  accepted — written with a `--` comment or without — and re-enters it on
+  every dial before anything else is sent; if the server refuses, the
+  statement raises that error instead of running elsewhere. A pool with
+  `database:` puts a connection a borrower moved with `USE` back in that
+  database before it hands it out again.
+- **Any number of distinct parameterised statements on one connection.**
+  The server holds 256 prepared statements per connection, and the driver
+  never closed one: from the 257th distinct statement on, the prepare was
+  refused and `exec_params` silently sent the statement as text with
+  client-side literals — a `Time` stored as a number, bytes as a hex
+  string — or failed for an Array or Hash parameter. The cache now closes
+  its least recently used statement on the server before it would pass 240,
+  and a prepare refused with `too many prepared statements` raises
+  `QueryError` instead of falling back.
+- **An id from `prepare_server` never runs another statement.** An id held
+  across a re-dial was sent to the new socket, where the server did not
+  know it or, worse, had given the number to a different statement since.
+  An id now carries the socket that issued it: `exec_prepared` prepares the
+  statement again on the current socket when the connection has re-dialled
+  (re-dialling first if it is broken, where it used to raise `connection is
+  broken; prepare the statement again`), and raises `QueryError` for an id
+  another connection issued. Ids are larger numbers than before; statements
+  handed out by `prepare_server` are never closed by the driver's cache.
+- **A stream Enumerator dropped half-read no longer crashes the process.**
+  `conn.stream(sql).next` runs the stream in the Enumerator's Fiber, inside
+  the connection's lock. Dropped there, the Fiber was collected still
+  owning the lock, and Ruby (3.3.8 measured) crashed when the lock was
+  freed after it: a segfault or an abort at a later garbage collection or
+  at exit, or a spin at exit. The driver now keeps the lock of a stream in
+  flight alive until the stream ends. The connection of a stream left that
+  way is still lost — read the Enumerator to its end to keep it.
+- **`Timeout.timeout` around a stream times out.** A stream cut short while
+  it waited for a frame (a `Timeout`, an `Interrupt`, `Thread#kill`) went on
+  to drain the rest of the result before the exception could propagate —
+  for as long as the server took, or for ever — and could read on from the
+  middle of a frame. It now marks the connection broken and raises at once.
+- A drain cut short the same way (a stream whose block breaks out, under a
+  timeout) left the rest of the stream on a connection that was not marked
+  broken: the next statements read the leftover chunks, and after them each
+  statement got the reply of an earlier one. The connection is now marked
+  broken.
+- A re-dial cut short the same way left a half-made connection whose next
+  statement read the handshake's or `Hello`'s reply as its own. It is now
+  marked broken and dialled again.
+- A re-dial that fails because no member is reachable no longer closes the
+  connection for good: the next statement dials again, as documented.
+
 ## [1.5.0] - 2026-11-15
 
 ### Added
@@ -280,6 +353,7 @@ batches, a 2 500-row stream, error handling, and the `drivers` table showing
   because it is a bundled gem since Ruby 3.4.
 - The example moved to `examples/basic.rb`.
 
+[1.5.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/porcupin26/skaidb-ruby/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/porcupin26/skaidb-ruby/compare/v1.3.0...v1.4.0
