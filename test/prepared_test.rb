@@ -181,8 +181,7 @@ class PreparedStatementsTest < Minitest::Test
       c = connect(srv)
       c.exec_params("UPDATE t SET v = $1 WHERE id = $2", [1, 1]) # A takes the first id
       c.exec_params("DELETE FROM t WHERE v = $1 AND id = $2", [2, 2])
-      srv.close_all # lost while idle
-      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") }
+      restart(srv, c) # lost while idle
       # on the new connection B comes first, and takes the id A had on the old one
       c.exec_params("DELETE FROM t WHERE v = $1 AND id = $2", [3, 3])
       c.exec_params("UPDATE t SET v = $1 WHERE id = $2", [4, 4])
@@ -197,17 +196,15 @@ class PreparedStatementsTest < Minitest::Test
       c = connect(srv)
       a, = c.prepare_server(A)
       b, = c.prepare_server(B)
-      srv.close_all # lost while idle
-      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") }
+      restart(srv, c) # lost while idle
       c.exec_params("DELETE FROM t WHERE v = $1 AND id = $2", [3, 3]) # B first on the new connection
       # A, by the id obtained before the loss: prepared on the new connection first
       assert_equal 1, c.exec_prepared(a, [4, 4], 1).cmd_tuples
       assert_equal 1, c.exec_prepared(b, [5, 5], 1).cmd_tuples
       assert_equal [[B, [3, 3]], [A, [4, 4]], [B, [5, 5]]], table.executed
       assert_equal [A, B, B, A], table.prepares
-      # and again after another loss, met by exec_prepared itself
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(b, [6, 6], 1) }
+      # and again after another loss, found by exec_prepared itself
+      restart(srv, c)
       assert_equal 1, c.exec_prepared(a, [7, 7], 1).cmd_tuples
       assert_equal [A, [7, 7]], table.executed.last
       assert_equal 3, srv.connections

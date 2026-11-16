@@ -89,7 +89,10 @@ module FakeSkaidb
   end
 
   # ---- request parsers (client -> server payloads, §3) ---------------------
-  Request = Struct.new(:op, :consistency, :sql, :id, :params, :rows, :name, :version, :raw, keyword_init: true)
+  # +conn+ is the number of the connection the request arrived on (1 for the
+  # first one the server accepted); the server fills it in.
+  Request = Struct.new(:op, :consistency, :sql, :id, :params, :rows, :name, :version, :raw, :conn,
+                       keyword_init: true)
 
   def self.parse_request(payload)
     r = Skaidb::Reader.new(payload)
@@ -137,6 +140,7 @@ module FakeSkaidb
     attr_accessor :corrupt_server_signature, :handler, :refuse, :on_auth_start
 
     # password: the one password every user has.
+    # tls: an OpenSSL::SSL::SSLContext to serve TLS with (see FakeSkaidb.tls).
     # handler: ->(req, conn) { payload | [payloads] | :close | :half_close | nil }
     #   for every post-handshake request; Hello is answered with Ddl unless
     #   the handler returns something; nil for anything else answers Error.
@@ -150,8 +154,9 @@ module FakeSkaidb
     #   the challenge is sent — a handshake a test can sit on.
     # hangups: the connections the CLIENT ended — it closed its socket while
     #   the server still held the session (and whatever was open on it).
-    def initialize(password: "secret", &handler)
+    def initialize(password: "secret", tls: nil, &handler)
       @password = password
+      @tls = tls
       @handler = handler || ->(_req, _conn) { nil }
       @requests = []
       @hellos = []
@@ -179,18 +184,46 @@ module FakeSkaidb
             sock.close rescue nil
             next
           end
-          number = @mutex.synchronize do
-            @sockets << sock
-            @connections += 1
+          @threads << Thread.new(sock) do |raw|
+            s = secured(raw) or next
+            number = @mutex.synchronize do
+              @sockets << s
+              @connections += 1
+            end
+            serve(s, number)
           end
-          @threads << Thread.new(sock, number) { |s, n| serve(s, n) }
         end
       end
       self
     end
 
-    # Kill every live connection, as a node restart would.
+    # Kill every live connection, as a node restart would. (Under TLS the
+    # TCP connection is what is closed: a killed process says no goodbye.)
     def close_all
+      socks = @mutex.synchronize { s = @sockets.dup; @sockets.clear; s }
+      socks.each { |s| s.to_io.close rescue nil }
+    end
+
+    # Stop SENDING on every live connection and keep each one open: the
+    # client reads end-of-file, its writes still succeed, and whatever it
+    # writes is read and recorded here as before. On loopback this is what a
+    # connection closed while idle looks like over a real network, where the
+    # write to the dead socket succeeds and only the read fails.
+    def half_close_all
+      @mutex.synchronize { @sockets.dup }.each { |s| s.to_io.close_write rescue nil }
+    end
+
+    # Reset every live connection (SO_LINGER 0: the close sends RST, not FIN).
+    def reset_all
+      socks = @mutex.synchronize { s = @sockets.dup; @sockets.clear; s }
+      socks.each do |s|
+        s.to_io.setsockopt(Socket::SOL_SOCKET, Socket::SO_LINGER, [1, 0].pack("ii")) rescue nil
+        s.to_io.close rescue nil
+      end
+    end
+
+    # Say goodbye on every live TLS connection (close_notify) and close it.
+    def close_all_politely
       socks = @mutex.synchronize { s = @sockets.dup; @sockets.clear; s }
       socks.each { |s| s.close rescue nil }
     end
@@ -220,12 +253,27 @@ module FakeSkaidb
       sock.write(FakeSkaidb.frame(payload))
     end
 
+    # The socket to serve: the TCP socket itself, or the TLS session on it
+    # (nil when the client did not complete the TLS handshake).
+    def secured(raw)
+      return raw unless @tls
+
+      ssl = OpenSSL::SSL::SSLSocket.new(raw, @tls)
+      ssl.sync_close = true
+      ssl.accept
+      ssl
+    rescue StandardError
+      raw.close rescue nil
+      nil
+    end
+
     def serve(sock, number)
       conn = { sock: sock, user: nil, number: number }
       return unless handshake(sock, conn)
 
       while (payload = read_frame(sock))
         req = FakeSkaidb.parse_request(payload)
+        req.conn = number
         @mutex.synchronize do
           @requests << req
           @hellos << req if req.op == 8
@@ -236,15 +284,15 @@ module FakeSkaidb
           return
         end
         if out == :half_close
-          sock.close_write
+          sock.to_io.close_write
           next
         end
         out = (req.op == 8 ? F.ddl : F.error("fake server: unhandled op #{req.op}")) if out.nil?
         Array(out).each { |p| send(sock, p) }
       end
       hung_up(sock) # end-of-file where a request would start
-    rescue Errno::ECONNRESET, Errno::EPIPE
-      hung_up(sock) # gone with a reply still on its way to it
+    rescue Errno::ECONNRESET, Errno::EPIPE, OpenSSL::SSL::SSLError
+      hung_up(sock) # gone with a reply still on its way to it, or (TLS) without a goodbye
     rescue IOError, SystemCallError
       nil
     ensure
@@ -296,6 +344,31 @@ module FakeSkaidb
     def hmac(key, msg)
       OpenSSL::HMAC.digest(OpenSSL::Digest::SHA256.new, key, msg)
     end
+  end
+
+  # For a server that speaks TLS: [context, ca_file] — an SSLContext with a
+  # self-signed certificate for the name skaidb (the driver's default
+  # tls_server_name), and that certificate as a PEM file under +dir+ for the
+  # client's tls_ca:.
+  def self.tls(dir)
+    key = OpenSSL::PKey::EC.generate("prime256v1")
+    cert = OpenSSL::X509::Certificate.new
+    cert.version = 2
+    cert.serial = OpenSSL::BN.rand(64)
+    cert.subject = cert.issuer = OpenSSL::X509::Name.parse("CN=skaidb")
+    cert.public_key = key
+    cert.not_before = Time.now - 60
+    cert.not_after = Time.now + 3600
+    ef = OpenSSL::X509::ExtensionFactory.new(cert, cert)
+    cert.add_extension(ef.create_extension("basicConstraints", "CA:TRUE", true))
+    cert.add_extension(ef.create_extension("subjectAltName", "DNS:skaidb"))
+    cert.sign(key, OpenSSL::Digest.new("SHA256"))
+    ctx = OpenSSL::SSL::SSLContext.new
+    ctx.cert = cert
+    ctx.key = key
+    ca_file = File.join(dir, "fake-skaidb-ca.pem")
+    File.write(ca_file, cert.to_pem)
+    [ctx, ca_file]
   end
 
   # A scripted handler: `script[sql]` answers OP_QUERY / OP_QUERY_STREAM /

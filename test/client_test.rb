@@ -551,13 +551,15 @@ class ClientTest < Minitest::Test
   def test_a_lost_connection_is_re_dialled_on_the_next_statement_and_prepared_ids_are_dropped
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted(
-        { "SELECT 1" => F.rows(["c"], [[1]]), %(USE "app") => F.ddl },
+        # the server takes the statement and goes away instead of answering
+        { "SELECT 1" => F.rows(["c"], [[1]]), %(USE "app") => F.ddl, "SELECT lost" => :close },
         prepared: { "SELECT ?" => 1 }, on_execute: ->(_s, req) { F.rows(["p"], [[req.params[0]]]) }
       )
       c = connect(srv, database: "app")
       assert_equal 7, c.exec_params("SELECT $1", [7])[0]["p"]
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") }
+      # lost under a statement: that statement may have run, so it is not
+      # sent again — it raises, and the one after it re-dials
+      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT lost") }
       refute c.usable?
       assert_equal 1, c.exec("SELECT 1")[0]["c"] # transparently reconnected
       assert c.usable?
@@ -575,9 +577,8 @@ class ClientTest < Minitest::Test
       srv.handler = FakeSkaidb.scripted("SELECT 1" => F.rows(["c"], [[1]]))
       c = connect(srv)
       srv.refuse = true # the server is down: its port accepts, then hangs up
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } # meets the loss
-      2.times do
+      restart(srv, c)
+      3.times do
         e = assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } # re-dials, in vain
         assert_match(/no reachable endpoint/, e.message)
       end
@@ -603,8 +604,7 @@ class ClientTest < Minitest::Test
         (hellos += 1) == 2 ? (gate.pop && F.ddl) : F.ddl # the second connection's Hello is sat on
       end
       c = connect(srv)
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } # meets the loss
+      restart(srv, c)
       worker = Thread.new do
         Thread.current.report_on_exception = false
         c.exec("SELECT 1") # re-dials: handshake, then Hello — whose reply does not come
@@ -875,30 +875,29 @@ class ClientTest < Minitest::Test
 
   def test_a_cached_parameterised_statement_re_dials_a_lost_connection_too
     with_server do |srv|
+      lost = -1 # the server takes a statement bound to this value and goes away instead of answering
       srv.handler = FakeSkaidb.scripted(
         {}, prepared: { "SELECT ?" => 1, "INSERT INTO t (id) VALUES (?)" => 1 },
-        on_execute: ->(_s, req) { F.rows(["p"], [[req.params[0]]]) }
+        on_execute: ->(_s, req) { req.params[0] == lost ? :close : F.rows(["p"], [[req.params[0]]]) },
+        on_batch: ->(_s, req) { req.rows[0][0] == lost ? :close : F.mutation(req.rows.length) }
       )
       c = connect(srv)
       assert_equal 7, c.exec_params("SELECT $1", [7])[0]["p"]
       assert_equal 2, c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[1], [2]])
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec_params("SELECT $1", [8]) } # discovers the loss
+      assert_raises(Skaidb::ConnectionError) { c.exec_params("SELECT $1", [lost]) } # the loss, under it
       refute c.usable?
       # the cached id is not sent down the dead socket: re-dialled, prepared again
       assert_equal 9, c.exec_params("SELECT $1", [9])[0]["p"]
       assert c.usable?
       assert_equal 2, srv.connections
       assert_equal 3, srv.requests.count { |q| q.op == 2 }
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[3]]) }
+      assert_raises(Skaidb::ConnectionError) { c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[lost]]) }
       assert_equal 1, c.exec_batch("INSERT INTO t (id) VALUES ($1)", [[3]])
       assert_equal 3, srv.connections
       # an id handed out by prepare_server is never sent down another socket:
       # its statement is prepared again on the one that replaced it
       id, = c.prepare_server("SELECT ?")
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [1], 1) } # meets the loss
+      assert_raises(Skaidb::ConnectionError) { c.exec_prepared(id, [lost], 1) } # the loss, under it
       prepares = srv.requests.count { |q| q.op == 2 }
       assert_equal 1, c.exec_prepared(id, [1], 1)[0]["p"]
       assert_equal prepares + 1, srv.requests.count { |q| q.op == 2 }
@@ -909,7 +908,7 @@ class ClientTest < Minitest::Test
 
   def test_pool_reuses_idle_connections_and_discards_broken_ones
     with_server do |srv|
-      srv.handler = FakeSkaidb.scripted("SELECT 1" => F.rows(["c"], [[1]]))
+      srv.handler = FakeSkaidb.scripted("SELECT 1" => F.rows(["c"], [[1]]), "SELECT lost" => :close)
       pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret", maxsize: 1)
       3.times { pool.with { |c| assert_equal 1, c.exec("SELECT 1")[0]["c"] } }
       assert_equal 1, srv.connections
@@ -921,9 +920,10 @@ class ClientTest < Minitest::Test
       assert b.finished?
       refute a.finished?
       # a broken connection is dropped, not handed out again
-      srv.close_all
-      pool.with { |c| assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") } }
+      pool.with { |c| assert_raises(Skaidb::ConnectionError) { c.exec("SELECT lost") } }
+      assert a.finished?
       pool.with { |c| assert_equal 1, c.exec("SELECT 1")[0]["c"] }
+      assert_equal 3, srv.connections
       pool.close
       assert_raises(Skaidb::Error) { pool.checkout }
       assert_raises(ArgumentError) { Skaidb::Pool.new(maxsize: 0) }

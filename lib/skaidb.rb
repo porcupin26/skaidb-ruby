@@ -1466,6 +1466,34 @@ module Skaidb
       @closed
     end
 
+    # Whether this connection was lost while it sat idle: the peer has closed
+    # it, reset it, or written to it unasked. One poll of the socket and at
+    # most one peek at it, neither of which waits — no round trip.
+    #
+    # A server closes its idle connections when it restarts, fails over or
+    # times them out. The next request then finds a dead socket — and over a
+    # real network WRITING to it succeeds (the reset has not come back yet);
+    # only the read of the reply fails, by which time the statement cannot
+    # be sent again, since for all the driver knows it ran. So the look
+    # comes first: on an idle connection the server sends nothing, and
+    # anything there is to read — end-of-file, a reset, bytes nobody asked
+    # for — means the connection carries no further statement.
+    #
+    # Under TLS the TCP socket is what is looked at, not the decrypted
+    # stream: a peer that is gone ends the TCP connection whether or not it
+    # said a TLS goodbye first. A connection with a stream in flight is not
+    # idle — the frames on its socket are that stream's — and is not looked
+    # at; nor is one in the middle of another thread's round trip, which the
+    # look waits out (it takes the connection's lock).
+    #
+    # Internal: ensure_live! asks before every statement, and Pool before it
+    # hands an idle connection out.
+    def lost_while_idle?
+      return false if @closed || @broken || @streaming || @sock.nil?
+
+      @mutex.synchronize { !@broken && !@streaming && peer_gone? }
+    end
+
     # Internal, for Pool: put the session back in the database the connection
     # was opened in (+database:+) when a USE statement has moved it since.
     # One round trip, and none when there is nothing to put back.
@@ -1501,14 +1529,32 @@ module Skaidb
       nil
     end
 
-    # Re-dial if the transport died since the last statement, BEFORE anything
-    # is prepared on it.
+    # The poll and the peek of lost_while_idle? (the caller holds @mutex):
+    # whether the socket has anything to read. Readable and nothing there
+    # after all is a socket that is alive; an error from either call is one
+    # that is not.
+    def peer_gone?
+      io = @sock.to_io # under TLS, the TCP socket beneath it
+      return false unless IO.select([io], nil, nil, 0)
+
+      io.recv_nonblock(1, Socket::MSG_PEEK, exception: false) != :wait_readable
+    rescue StandardError
+      true
+    end
+
+    # Re-dial if the transport died since the last statement — or while the
+    # connection sat idle, which is looked for here (lost_while_idle?) —
+    # BEFORE anything is written or prepared on it.
     #
     # The prepared-statement cache MUST be cleared: an id is only valid on the
     # connection that created it, so carrying one across a reconnect would run
     # a different statement (or fail obscurely).
     def ensure_live!
       raise ConnectionError, "connection is closed" if @closed
+      # Found dead before the request is written: exactly as after a failed
+      # write, except that nothing was sent — so nothing is reported, and
+      # the statement goes out on the connection dialled below.
+      mark_broken! if lost_while_idle?
       return unless @broken
       # A transaction lives on the socket that carried its BEGIN. Re-dialling
       # inside the helper would run the rest of the block, and the COMMIT, on
@@ -2213,9 +2259,10 @@ module Skaidb
             close_quietly(conn)
             next
           end
-        elsif !conn.usable?
-          # A connection the server closed while it sat idle still looks
-          # fine locally, so check before handing it out.
+        elsif !conn.usable? || conn.lost_while_idle?
+          # A connection the server closed while it sat idle is not handed
+          # out as a live one: the look finds it (no round trip), and the
+          # borrower gets another idle connection or a new one.
           close_quietly(conn)
           next
         elsif !in_pool_database?(conn)

@@ -535,8 +535,7 @@ class TransactionTest < Minitest::Test
       # statement and for the helper's own BEGIN alike
       assert_equal 1, c.exec("SELECT 1")[0]["c"]
       assert_equal 2, srv.connections
-      srv.close_all
-      assert_raises(Skaidb::ConnectionError) { c.exec("SELECT 1") }
+      restart(srv, c)
       assert_equal :done, c.transaction { |_tx| :done }
       assert_equal 3, srv.connections
       assert_equal %w[BEGIN COMMIT], statements(srv).last(2)
@@ -649,7 +648,7 @@ class TransactionTest < Minitest::Test
           tx.exec(DEBIT) # statement 1 succeeds
           tx.exec_params(write, [1, 2]) # prepared, and cached on this connection
           id, = tx.prepare_server("UPDATE t SET v = ? WHERE id = ?")
-          srv.close_all # the connection is lost
+          restart(srv, tx) # the connection is lost
           received = srv.requests.length
           # statement 2 meets the loss; the block rescues it and carries on
           assert_raises(Skaidb::ConnectionError) { tx.exec(CREDIT) }
@@ -696,7 +695,7 @@ class TransactionTest < Minitest::Test
         pool.transaction do |conn|
           held = conn
           conn.exec(DEBIT)
-          srv.close_all
+          restart(srv, conn)
           assert_raises(Skaidb::ConnectionError) { conn.exec(CREDIT) }
           assert_raises(Skaidb::ConnectionError) { conn.exec(CREDIT) }
           :returned
@@ -724,10 +723,35 @@ class TransactionTest < Minitest::Test
       plain = connect(srv)
       c = connect(srv)
       [plain, c].each { |conn| assert_equal 1, conn.exec("SELECT 1")[0]["c"] }
-      srv.close_all # the server restarts while both sit idle
-      # an ordinary statement: the one that meets the loss raises
+      restart(srv, plain, c) # the server restarts while both sit idle
+      # an ordinary statement finds its connection gone before it writes
+      # anything, and runs on a new one
+      assert_equal 1, plain.exec("SELECT 1")[0]["c"]
+      # the helper's opening statement is such a statement: nothing is open
+      # yet, so BEGIN goes out on a new session and the transaction runs there
+      runs = 0
+      value = c.transaction do |tx|
+        runs += 1
+        tx.exec(DEBIT)
+        :done
+      end
+      assert_equal [:done, 1], [value, runs]
+      assert_equal ["BEGIN", DEBIT, "COMMIT"], statements(srv).last(3)
+      assert_equal 4, srv.connections # two dialled, two re-dialled
+      [plain, c].each(&:close)
+    end
+  end
+
+  def test_the_opening_statement_lost_in_flight_fails_as_any_statement_does
+    with_server do |srv|
+      # the server takes the statement and goes away instead of answering:
+      # whether it ran is not known, so it is not sent again
+      srv.handler = FakeSkaidb.scripted(script("SELECT lost" => :close, "BEGIN" => in_turn(:close, F.ddl)))
+      plain = connect(srv)
+      c = connect(srv)
+      # an ordinary statement: the one lost in flight raises
       # ConnectionError, the one after it re-dials
-      assert_raises(Skaidb::ConnectionError) { plain.exec("SELECT 1") }
+      assert_raises(Skaidb::ConnectionError) { plain.exec("SELECT lost") }
       assert_equal 1, plain.exec("SELECT 1")[0]["c"]
       # the helper's opening statement is such a statement: the same
       # ConnectionError, the block not run, nothing else sent ...
@@ -735,10 +759,10 @@ class TransactionTest < Minitest::Test
       runs = 0
       assert_raises(Skaidb::ConnectionError) { c.transaction { |_tx| runs += 1 } }
       assert_equal 0, runs
-      assert_equal sent, statements(srv).length
+      assert_equal sent + 1, statements(srv).length # the BEGIN, and nothing after it
       refute c.usable?
-      # ... and the next call re-dials: nothing is open yet, so BEGIN goes
-      # out on the new session and the transaction runs there
+      # ... and the next call re-dials: nothing is open, so BEGIN goes out
+      # on the new session and the transaction runs there
       value = c.transaction do |tx|
         runs += 1
         tx.exec(DEBIT)
@@ -755,15 +779,15 @@ class TransactionTest < Minitest::Test
     with_server do |srv|
       srv.handler = FakeSkaidb.scripted(script)
       pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret")
-      pool.with { |conn| conn.exec("SELECT 1") }
-      srv.close_all # the idle connection is gone, and looks fine from here
-      assert_raises(Skaidb::ConnectionError) { pool.with { |conn| conn.exec("SELECT 1") } }
-      assert_equal 1, pool.with { |conn| conn.exec("SELECT 1")[0]["c"] } # a new connection
-      srv.close_all
+      idle = pool.with { |conn| conn.exec("SELECT 1") && conn }
+      restart(srv, idle) # the idle connection is gone
+      # the checkout does not hand it out: the statement runs on a new one
+      idle = pool.with { |conn| assert_equal(1, conn.exec("SELECT 1")[0]["c"]) && conn }
+      assert_equal 2, srv.connections
+      restart(srv, idle)
       runs = 0
-      assert_raises(Skaidb::ConnectionError) { pool.transaction { |_conn| runs += 1 } }
-      assert_equal 0, runs
-      assert_equal :done, pool.transaction { |conn| conn.exec(DEBIT) && :done }
+      assert_equal :done, pool.transaction { |conn| (runs += 1) && conn.exec(DEBIT) && :done }
+      assert_equal 1, runs
       assert_equal ["BEGIN", DEBIT, "COMMIT"], statements(srv).last(3)
       assert_equal 3, srv.connections
       assert_equal [0, 1], pool.members[0].values_at(:in_use, :idle)

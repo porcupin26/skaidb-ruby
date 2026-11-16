@@ -164,11 +164,15 @@ the same in every skaidb driver
   is closed instead of kept.
 - `checkout` and `checkin` both validate with `usable?`: a connection broken
   by a transport error, or left mid-stream by an abandoned Enumerator, is
-  closed and dropped rather than handed on. `usable?` is local knowledge
-  only — a connection the server closed while it sat idle still looks fine
-  and will fail its first statement with `Skaidb::ConnectionError`; that
-  failure marks it broken, so `checkin` discards it and the next checkout
-  gets a fresh one. Retry the statement in that case if it is safe to.
+  closed and dropped rather than handed on. `checkout` also looks at the
+  socket of the idle connection it is about to hand out (a poll, no round
+  trip): one the server closed while it sat idle — a member restart, an
+  idle timeout — is closed and the checkout takes the next idle connection
+  or dials, so a restart costs the borrowers nothing. A connection lost
+  while its borrower holds it idle is replaced under the borrower the same
+  way, at its next statement. Only a connection lost under a statement —
+  request written, no reply — raises `Skaidb::ConnectionError`; `checkin`
+  then discards it. Send that statement again if it is safe to.
 - A transaction belongs to one connection. `pool.transaction { |conn| … }`
   checks one out, runs `Connection#transaction` on it (`begin`, the block,
   `COMMIT`, the whole of it again when the `COMMIT` is refused with

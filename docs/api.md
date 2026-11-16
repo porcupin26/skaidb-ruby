@@ -160,7 +160,11 @@ use it meanwhile.
   a reply could not be read
   or a round trip was cut short with its reply outstanding, or while a
   stream is in flight (including one abandoned through external iteration).
-  No round-trip.
+  No round-trip, and no look at the socket: what the driver already knows.
+- `lost_while_idle?` — the look at the socket that every statement starts
+  with, on its own: `true` when the peer has closed or reset the idle
+  connection, or written to it unasked. No round-trip. `false` for a
+  connection that is closed, already broken or in the middle of a stream.
 - `endpoint` — the member the connection reached, as the `"host:port"` it
   dialed (it changes when a re-dial lands on another member).
 - `closed`, `finished?` — `true` after `close`.
@@ -179,8 +183,18 @@ by anything else (an `Interrupt`, `Timeout.timeout`, `Thread#kill`) marks it
 broken too, since that reply is still on its way; the exception propagates
 as it is. A connection marked broken closes its socket there and then, so
 the server drops the session — and a transaction left open on it — without
-waiting for the connection's next statement or its `close`. The next
-`exec`/`exec_params`/`exec_batch`/`stream`
+waiting for the connection's next statement or its `close`.
+
+Before each request is written the connection is looked at (a poll of the
+TCP socket and at most one peek, never a round trip): an idle connection has
+nothing to read, so an end-of-file, a reset or bytes nobody asked for mean
+the server closed it while it sat idle. It is then marked broken like any
+other lost connection — but nothing was sent on it, so nothing is raised:
+the statement re-dials and runs. A connection in the middle of a stream is
+not idle and is not looked at.
+
+A broken connection's next
+`exec`/`exec_params`/`exec_batch`/`exec_prepared`/`stream`
 re-dials across the original seeds (a pooled connection: in the pool's
 order, usable members first and the one it lost last), re-authenticates,
 re-sends `Hello`, re-enters the session's database, and starts with an empty
@@ -234,7 +248,10 @@ A thread-safe pool balanced across the cluster's members — see
   arguments are checked before a connection is checked out.
 - `checkout(affinity: nil) → Connection` — an idle connection to the member
   the policy picks, or a new one. Never blocks. `affinity` (any Hash key;
-  `nil` = pool-wide) scopes `read_your_writes`.
+  `nil` = pool-wide) scopes `read_your_writes`. An idle connection the
+  server closed while it sat in the pool is not handed out: it is found by
+  a look at its socket (no round trip) and closed, and the checkout goes on
+  to the next idle connection or dials.
 - `checkin(conn)` — return it; closed instead when broken, when its member
   is ejected or gone, or when `maxsize` are already idle.
 - `members → Array<Hash>` — per member: `:endpoint`, `:canonical`, `:state`

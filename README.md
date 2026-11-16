@@ -147,8 +147,16 @@ Each seed is `"host"` or `"host:port"` (the port after the last colon wins; a
 seed without a port uses `port:`). When a connection's transport dies, the
 **next statement re-dials** across the same seeds, re-authenticates, re-sends
 `Hello`, re-enters the session's database, and drops the connection's prepared
-statements. The statement that discovered the loss raises
-`Skaidb::ConnectionError`; the one after it goes through.
+statements.
+
+A connection the server closed **while it sat idle** — a member restart, a
+failover, an idle timeout — costs no statement. Before a request is written
+the driver looks at the socket (one poll, no round trip): an idle connection
+has nothing to read, so an end-of-file, a reset or stray bytes there mean it
+is gone, and the statement goes out on a new connection instead. A
+connection lost **under a statement** — the request was written and the
+reply did not come — raises `Skaidb::ConnectionError`: the statement may
+have run, so the driver does not send it again. The one after it re-dials.
 
 The database re-entered is the one the session was last in: `database:`, or
 the one a later `USE <name>` statement sent with `exec` moved it to. It is
@@ -354,7 +362,9 @@ pool.close                                    # closes idle connections
 blocks — when no idle connection is available a new one is dialed, and a
 returned connection beyond `maxsize` is closed. Connections are validated with
 `usable?` on checkout and check-in, so one broken by a transport error or an
-undrained stream is closed and replaced.
+undrained stream is closed and replaced; and an idle connection the server
+closed while it sat in the pool is found by a look at its socket (no round
+trip) and replaced before it is handed out.
 
 The pool spreads its connections across the members by the rules every skaidb
 driver shares

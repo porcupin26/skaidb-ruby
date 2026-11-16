@@ -33,12 +33,11 @@ class SessionDatabaseTest < Minitest::Test
     srv.requests.drop(mark).reject { |q| q.op == 8 || q.op == 2 }.map(&:sql)
   end
 
-  # Loses the idle connection, then runs the two statements: the first call
-  # meets the loss, the ones after it run on the re-dialled connection.
+  # Loses the idle connection, then runs the two statements: the first one
+  # finds the connection gone and re-dials, and both run on the new one.
   def lose_and_run(srv, conn)
-    srv.close_all
+    restart(srv, conn)
     mark = srv.requests.length
-    assert_raises(Skaidb::ConnectionError) { conn.exec(COUNT) }
     count = conn.exec(COUNT)[0]["count"]
     conn.exec(INSERT)
     [count, since(srv, mark)]
@@ -137,9 +136,8 @@ class SessionDatabaseTest < Minitest::Test
       srv.handler = handler("USE app" => refused_twice)
       c = connect(srv)
       c.exec("USE app")
-      srv.close_all
+      restart(srv, c)
       mark = srv.requests.length
-      assert_raises(Skaidb::ConnectionError) { c.exec(COUNT) }
       2.times do
         e = assert_raises(Skaidb::QueryError) { c.exec(INSERT) }
         assert_equal "database app does not exist", e.message

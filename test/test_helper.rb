@@ -9,11 +9,31 @@ require "fake_server"
 
 module ServerHelpers
   # Start a fake server for the block and stop it afterwards.
-  def with_server(password: "secret")
-    srv = FakeSkaidb::Server.new(password: password).start
+  def with_server(password: "secret", tls: nil)
+    srv = FakeSkaidb::Server.new(password: password, tls: tls).start
     yield srv
   ensure
     srv&.stop
+  end
+
+  # What the server just did to its connections — closed them, reset them,
+  # stopped sending — has reached this side: each of +conns+' sockets has
+  # something to read (an end-of-file, a reset). On loopback that is a
+  # matter of microseconds, and of no guarantee.
+  def let_the_loss_arrive(*conns)
+    conns.each do |conn|
+      io = conn.instance_variable_get(:@sock)&.to_io
+      next if io.nil? || io.closed?
+
+      IO.select([io], nil, nil, 2) or flunk "what the server did to the connection did not arrive"
+    end
+  end
+
+  # The server restarts while +conns+ sit idle: every connection is closed,
+  # and the close has reached the client's sockets.
+  def restart(srv, *conns)
+    srv.close_all
+    let_the_loss_arrive(*conns)
   end
 
   def connect(srv, **kw)
