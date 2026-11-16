@@ -465,6 +465,24 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_connect_that_reaches_no_endpoint_prints_no_warning
+    dead = TCPServer.new("127.0.0.1", 0)
+    dead_port = dead.addr[1]
+    dead.close
+    # ruby -w, whatever the suite was started with: before Ruby 3.0 it
+    # reports an instance variable read before anything was assigned to it
+    _out, err = capture_io do
+      verbose = $VERBOSE
+      $VERBOSE = true
+      begin
+        assert_raises(Skaidb::ConnectionError) { Skaidb.connect(host: "127.0.0.1", port: dead_port, timeout: 1) }
+      ensure
+        $VERBOSE = verbose
+      end
+    end
+    assert_equal "", err
+  end
+
   # A connection given its endpoints in a fixed order, as a pool gives them.
   def connect_in_order(*servers, **kw)
     opts = Skaidb.connection_options(user: "ada", password: "secret", **kw)

@@ -778,6 +778,9 @@ module Skaidb
                      "(tls_client_cert: and tls_client_key:)"
       end
       @mutex = Mutex.new
+      # Assigned before the first dial reads it: a dial whose first endpoint
+      # does not connect closes "the socket" it never had.
+      @sock = nil
       @closed = false
       # Transport died, and its socket is closed (see mark_broken!); the next
       # statement re-dials (see ensure_live!).
