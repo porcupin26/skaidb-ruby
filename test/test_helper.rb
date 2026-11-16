@@ -28,6 +28,36 @@ module ServerHelpers
     assert_equal count, srv.hangups, msg || "sockets the client has closed"
   end
 
+  # Runs the block and raises +error+ in it at the moment +conn+ has read
+  # the reply of its next round trip — nothing of the driver's has looked at
+  # that reply yet. Where an exception from outside (Timeout.timeout, an
+  # Interrupt, Thread#raise) lands is a matter of timing; this puts one at
+  # that exact point, every time.
+  def cut_after_the_reply(conn, error)
+    armed = true
+    trace = TracePoint.new(:return) do |tp|
+      next unless armed && tp.method_id == :round_trip && tp.self.equal?(conn)
+
+      armed = false
+      raise error
+    end
+    trace.enable { yield }
+  end
+
+  # Runs the block and raises +error+ in it where +conn+ is about to send
+  # the statement +sql+: the call has been made, nothing is written yet.
+  def cut_before_the_request(conn, sql, error)
+    armed = true
+    trace = TracePoint.new(:call) do |tp|
+      next unless armed && tp.method_id == :request && tp.self.equal?(conn)
+      next unless tp.binding.local_variable_get(:req).include?(sql.b)
+
+      armed = false
+      raise error
+    end
+    trace.enable { yield }
+  end
+
   # Wait (up to +secs+) until the block is true.
   def until_true(secs = 2)
     t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)

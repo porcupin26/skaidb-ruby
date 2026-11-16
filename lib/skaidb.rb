@@ -1191,6 +1191,14 @@ module Skaidb
       live = false
       summary = nil
       sets = nil
+      # Whether the reply is accounted for: read to its end (a reply of one
+      # frame), or in the hands of the row loop below, whose ensure drains
+      # it or retires the socket. Leaving before that — an Interrupt or a
+      # Timeout that lands between the header frame and the loop — would
+      # leave the rest of a row stream on a connection that looks idle, for
+      # the next statement to read as its reply. So the connection is
+      # marked broken on every way out that has not placed the reply.
+      placed = false
       @mutex.synchronize do
         started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         begin
@@ -1201,6 +1209,7 @@ module Skaidb
         end
         @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
         tag = reading_reply { r.u8 }
+        placed = tag != 5 # every other reply is this one frame (an unknown one is retired below)
         note_statement(sql) unless tag == 3
         case tag
         when 3
@@ -1231,16 +1240,18 @@ module Skaidb
           # `@broken`, `usable?` stays true, and the pool files a socket
           # parked mid-reply back for the next caller, who reads a leftover
           # chunk and gets "unknown response tag 6". That is the very
-          # desync the ensure below exists to prevent, reachable through a
-          # two-line window.
+          # desync the ensure below exists to prevent.
           live = true
-          @streaming = true
-          @stream_fiber = Fiber.current
-          Skaidb.keep_stream_lock(@mutex)
           reading = false
           begin
-            # Inside the begin: a header that cannot be read leaves through
-            # the ensure below like every other way out of the stream.
+            # Inside the begin, flags and header alike: from its first line
+            # the ensure below answers for the socket (+placed+), and a
+            # header that cannot be read leaves through it like every other
+            # way out of the stream.
+            placed = true
+            @streaming = true
+            @stream_fiber = Fiber.current
+            Skaidb.keep_stream_lock(@mutex)
             cols = reading_reply { Array.new(r.u32) { r.text } }
             summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
             while live
@@ -1303,6 +1314,8 @@ module Skaidb
           mark_broken!
           raise QueryError, "unexpected response tag #{tag} to stream request"
         end
+      ensure
+        mark_broken! unless placed
       end
       if sets
         # What exec's Result yields (the call's final result, the LAST set),

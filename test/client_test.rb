@@ -753,6 +753,39 @@ class ClientTest < Minitest::Test
     end
   end
 
+  def test_a_stream_cut_short_between_its_header_and_its_first_row_retires_the_socket
+    interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with
+    big = "SELECT * FROM big"
+    calls = {
+      "stream" => ->(c, seen) { c.stream(big) { |row| seen << row } },
+      "stream, as an Enumerator" => ->(c, seen) { c.stream(big).each { |row| seen << row } },
+      "stream with parameters" => ->(c, seen) { c.stream("SELECT * FROM big WHERE id > $1", [0]) { |row| seen << row } }
+    }
+    calls.each do |what, call|
+      with_server do |srv|
+        reply = [F.header(["id"]), F.chunk([[1], [2]]), F.chunk([[3]]), F.rows_end]
+        srv.handler = FakeSkaidb.scripted(big => reply, "SELECT * FROM big WHERE id > ?" => reply, ONE => ONE_ROW,
+                                          "SELECT 2" => F.rows(["c"], [[2]]))
+        c = connect(srv)
+        seen = []
+        # the header frame has been read; the exception lands before the
+        # stream has taken up the frames that follow it
+        assert_raises(interrupt, what) { cut_after_the_reply(c, interrupt) { call.call(c, seen) } }
+        assert_empty seen, what
+        # those frames are still coming, so nothing more goes down that
+        # socket: the connection is retired, not left looking idle
+        refute c.usable?, what
+        assert_hung_up srv, 1, what
+        assert_equal 1, srv.connections, what
+        # each statement after it reads its own reply — not a chunk of the stream
+        assert_equal [1, 2], [ONE, "SELECT 2"].map { |sql| c.exec(sql)[0]["c"] }, what
+        assert_equal 2, srv.connections, what
+        assert c.usable?, what
+        c.close
+      end
+    end
+  end
+
   def test_a_drain_cut_short_retires_the_socket_instead_of_leaving_the_stream_to_the_next_statement
     interrupt = Class.new(Exception) # an Interrupt, or what Timeout.timeout unwinds with
     cuts = {
