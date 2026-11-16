@@ -529,6 +529,90 @@ class TransactionTest < Minitest::Test
     end
   end
 
+  # ---- no statement of the block leaves the transaction's session ----------
+  # (PROTOCOL.md §6 rule 7)
+
+  def test_after_a_lost_connection_no_call_of_the_block_reaches_a_new_session
+    write = "UPDATE t SET v = $1 WHERE id = $2"
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(
+        script("SELECT big" => [F.header(["id"]), F.chunk([[1]]), F.rows_end]),
+        prepared: { "UPDATE t SET v = ? WHERE id = ?" => 2 }, on_execute: ->(_sql, _req) { F.mutation(1) }
+      )
+      c = connect(srv)
+      received = nil
+      e = assert_raises(Skaidb::ConnectionError) do
+        c.transaction do |tx|
+          tx.exec(DEBIT) # statement 1 succeeds
+          tx.exec_params(write, [1, 2]) # prepared, and cached on this connection
+          id, = tx.prepare_server("UPDATE t SET v = ? WHERE id = ?")
+          srv.close_all # the connection is lost
+          received = srv.requests.length
+          # statement 2 meets the loss; the block rescues it and carries on
+          assert_raises(Skaidb::ConnectionError) { tx.exec(CREDIT) }
+          # statement 3, a write, by every call that runs one: none re-dials
+          calls = {
+            "exec" => -> { tx.exec(CREDIT) },
+            "exec_params" => -> { tx.exec_params(CREDIT) },
+            "exec_params, prepared before the loss" => -> { tx.exec_params(write, [3, 4]) },
+            "exec_params, not prepared yet" => -> { tx.exec_params("UPDATE u SET v = $1", [5]) },
+            "exec_batch" => -> { tx.exec_batch(write, [[5, 6], [7, 8]]) },
+            "exec_prepared" => -> { tx.exec_prepared(id, [9, 10], 1) },
+            "stream" => -> { tx.stream("SELECT big") { |_row| flunk "no rows expected" } },
+            "stream, as an Enumerator" => -> { tx.stream("SELECT big").to_a },
+            "stream with parameters" => -> { tx.stream("SELECT $1", [1]) { |_row| flunk "no rows expected" } },
+            "a transaction inside it" => -> { tx.transaction { |_inner| flunk "the inner block must not run" } }
+          }
+          calls.each { |name, call| assert_raises(Skaidb::ConnectionError, name) { call.call } }
+          :returned # ... and the block returns normally
+        end
+      end
+      # the helper reports the loss; its COMMIT is not sent on a new session
+      assert_match(/lost inside a transaction/, e.message)
+      # nothing after the loss reached a session: no write, no COMMIT, no ROLLBACK
+      assert_equal received, srv.requests.length
+      assert_equal 1, srv.connections
+      refute c.usable?
+      # once the helper has returned the connection is what it is after any
+      # lost connection: its next statement re-dials
+      assert_equal 1, c.exec("SELECT 1")[0]["c"]
+      assert_equal 2, srv.connections
+      assert_equal 1, c.exec_params(write, [3, 4]).cmd_tuples
+      assert_equal [DEBIT, "COMMIT"], (c.transaction { |tx| tx.exec(DEBIT) } && statements(srv).last(2))
+      assert_equal 2, srv.connections
+      c.close
+    end
+  end
+
+  def test_pool_transaction_after_a_lost_connection_reaches_no_other_connection
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(script)
+      pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret")
+      held = nil
+      e = assert_raises(Skaidb::ConnectionError) do
+        pool.transaction do |conn|
+          held = conn
+          conn.exec(DEBIT)
+          srv.close_all
+          assert_raises(Skaidb::ConnectionError) { conn.exec(CREDIT) }
+          assert_raises(Skaidb::ConnectionError) { conn.exec(CREDIT) }
+          :returned
+        end
+      end
+      assert_match(/lost inside a transaction/, e.message)
+      # neither the block's statements nor the COMMIT went to another connection
+      assert_equal ["BEGIN", DEBIT], statements(srv)
+      assert_equal 1, srv.connections
+      # the connection is not handed out again; the next transaction dials its own
+      assert held.finished?
+      assert_equal [0, 0], pool.members[0].values_at(:in_use, :idle)
+      assert_equal :done, pool.transaction { |conn| conn.exec(DEBIT) && :done }
+      assert_equal ["BEGIN", DEBIT, "COMMIT"], statements(srv).drop(2)
+      assert_equal 2, srv.connections
+      pool.close
+    end
+  end
+
   # ---- the pool ------------------------------------------------------------
 
   def test_pool_transaction_holds_one_connection_for_every_attempt_and_returns_it
