@@ -152,6 +152,35 @@ yields the connection, then sends `COMMIT`.
 The whole transaction runs on this one connection, so no other thread may
 use it meanwhile.
 
+**A transaction written by hand** — `exec("BEGIN")`, statements,
+`exec("COMMIT")` — is followed too. A statement the server accepted whose
+first word is `BEGIN` (`BEGIN`, `BEGIN TRANSACTION`, `BEGIN ATOMIC …`) opens
+it; a statement that is exactly `COMMIT [TRANSACTION]` or
+`ROLLBACK [TRANSACTION]` ends it once the server has answered, with success
+or with an error. They are read from `exec`, `query`, `exec_params` and
+`stream`, with `--` comments skipped and an optional trailing `;`. While
+the transaction is open:
+
+- a lost connection is not replaced. The statement under which it is lost
+  — or before which it is found lost, see [Reconnect](#reconnect) — raises
+  `ConnectionError`, and so does every further statement, by whichever call
+  (`connection lost inside a transaction: …`); none is sent on a new
+  session, where it would be committed on its own;
+- `ROLLBACK` returns its usual `:ddl` Result without being sent (the server
+  discarded the transaction with the connection), and `COMMIT` raises
+  `ConnectionError` (`… COMMIT was not sent and nothing was committed`).
+  Either one ends the transaction; the next statement re-dials;
+- a connection lost under the `COMMIT` itself raises `ConnectionError`
+  `connection lost under COMMIT: whether the transaction was committed is
+  not known (…)` — from `transaction` as well — and the transaction is over
+  for the driver;
+- a `COMMIT` or `ROLLBACK` cut short before the server answered it (an
+  `Interrupt`, a `Timeout`) closes the socket, so the transaction does not
+  stay open behind a statement the caller was told had failed.
+
+`transaction` notes its own `BEGIN` and `COMMIT` the same way and leaves
+nothing noted when it returns.
+
 ### State
 
 - `consistency` / `consistency=` — the default level (`0`/`1`/`2`; the setter
@@ -207,9 +236,11 @@ in a `USE` of its own). It is entered before anything else is sent, and a refusa
 raised to the statement that caused the re-dial — which is not sent — so no
 statement runs in another database. If the re-dial fails, that statement
 raises `ConnectionError` and the
-one after it tries again. Inside `transaction` there is no re-dial: the
-transaction ended with its socket, so every further statement raises
-`ConnectionError` until the helper returns.
+one after it tries again. Inside a transaction — the helper's, or one
+opened with a `BEGIN` statement — there is no re-dial: the transaction
+ended with its socket, so every further statement raises `ConnectionError`
+until the helper returns, or until a hand-written transaction's `ROLLBACK`
+or `COMMIT` ends it (see [Transactions](#transactions)).
 
 ## `Skaidb::Result`
 

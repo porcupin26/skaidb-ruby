@@ -793,6 +793,11 @@ module Skaidb
       # The transaction helper is between its BEGIN and its COMMIT/ROLLBACK,
       # so a lost socket must not be re-dialled (see ensure_live!).
       @in_transaction = false
+      # A transaction is open on this session: the server accepted a BEGIN,
+      # the helper's or one the application sent itself, and no COMMIT or
+      # ROLLBACK has ended it (see following). A lost socket is not
+      # re-dialled under it either.
+      @transaction = false
       # Statements prepared on this socket, SQL => [id, nparams]: the ones
       # the driver prepared for exec_params / exec_batch, least recently used
       # first, and the ones prepare_server handed to the application (see
@@ -807,7 +812,7 @@ module Skaidb
       @last_prepare_error = nil
       # The session database, as the USE target every dial re-enters: the one
       # the connection was opened in (+database:+), and the one it is in now
-      # — a USE statement the server accepted moves it (see note_use).
+      # — a USE statement the server accepted moves it (see following).
       @dial_use = database.to_s.empty? ? nil : %("#{database.to_s.gsub('"', '""')}")
       @session_use = @dial_use
       # Retained so a reconnect repeats the original connect exactly.
@@ -1094,6 +1099,13 @@ module Skaidb
       Skaidb.check_transaction_arguments(attempts, block_given?)
 
       enclosing = @in_transaction
+      # A transaction already noted on this session when the helper is
+      # called (a hand-written BEGIN, an enclosing helper's): the helper's
+      # own BEGIN and COMMIT are noted like any other, and whatever way it
+      # is left, the note is back to this one — a helper that lost its
+      # connection has reported that, and leaves nothing for the
+      # application to end.
+      outer = @transaction
       attempt = 0
       # Whether the transaction is over, by what the server answered: the
       # opening statement refused, a ROLLBACK or the COMMIT answered. False
@@ -1154,6 +1166,7 @@ module Skaidb
         # is unwinding may be a timeout, and whether the opening statement
         # was sent at all is not known.)
         mark_broken! unless over
+        @transaction = outer
       end
     end
 
@@ -1226,11 +1239,18 @@ module Skaidb
       # Built before anything touches the socket, so a parameter that cannot
       # be bound is refused without a round trip (or a re-dial).
       req = stream_request(sql, params, level)
+      # A statement that changes the session (USE, BEGIN, COMMIT, ROLLBACK)
+      # is followed here as it is from exec. One with parameters is none.
+      change = params.empty? ? session_change(sql.to_s) : nil
+      ended = end_lost_transaction(change)
+      return ended if ended
+
       ensure_live!
 
       live = false
       summary = nil
       sets = nil
+      plain = nil # the Result of a statement that answered with no rows to stream
       # Whether the reply is accounted for: read to its end (a reply of one
       # frame), or in the hands of the row loop below, whose ensure drains
       # it or retires the socket. Leaving before that — an Interrupt or a
@@ -1239,124 +1259,127 @@ module Skaidb
       # the next statement to read as its reply. So the connection is
       # marked broken on every way out that has not placed the reply.
       placed = false
-      @mutex.synchronize do
-        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        begin
-          r = Reader.new(round_trip(req))
-        rescue ConnectionError
-          observe_failure
-          raise
-        end
-        @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
-        tag = reading_reply { r.u8 }
-        placed = tag != 5 # every other reply is this one frame (an unknown one is retired below)
-        note_statement(sql) unless tag == 3
-        case tag
-        when 3
-          msg = reading_reply { r.text }
-          if msg.include?("unknown opcode")
-            what = params.empty? ? "streaming" : "parameterised streaming (skaidb >= 0.330)"
-            raise QueryError, "server does not support #{what}: #{msg}"
-          end
-          raise Skaidb.statement_error(msg)
-        when 1
-          affected = reading_reply { r.u64 }
-          return Result.new(fields: [], rows: [], cmd_tuples: affected, kind: :mutation) # not row-producing
-        when 2
-          note_use(sql.to_s) if params.empty?
-          return Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
-        when 8
-          # ResultSets: a CALL whose body EMITted is answered with every set
-          # in ONE frame, streamed or not — the frame exec receives, decoded
-          # by the same code. Nothing follows it, so the rows are yielded
-          # below, with the connection free.
-          sets = reading_reply { parse_result_sets(r) }
-        when 5
-          # The server has already committed to a row stream, so from here
-          # the socket carries frames this call owns — mark it BEFORE
-          # parsing the header, not after. `Reader#take` raises on a
-          # truncated or absurd column count, and a raise between the
-          # commitment and the flag skips the drain entirely: nothing sets
-          # `@broken`, `usable?` stays true, and the pool files a socket
-          # parked mid-reply back for the next caller, who reads a leftover
-          # chunk and gets "unknown response tag 6". That is the very
-          # desync the ensure below exists to prevent.
-          live = true
-          reading = false
+      following(change) do
+        @mutex.synchronize do
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
           begin
-            # Inside the begin, flags and header alike: from its first line
-            # the ensure below answers for the socket (+placed+), and a
-            # header that cannot be read leaves through it like every other
-            # way out of the stream.
-            placed = true
-            @streaming = true
-            @stream_fiber = Fiber.current
-            Skaidb.keep_stream_lock(@mutex)
-            cols = reading_reply { Array.new(r.u32) { r.text } }
-            summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
-            while live
-              reading = true
-              frame = read_frame
-              reading = false
-              fr = Reader.new(frame)
-              case reading_reply { fr.u8 }
-              when 6
-                reading_reply { fr.u32 }.times do
-                  cells = reading_reply { Array.new(fr.u32) { Skaidb.decode_value(Reader.new(fr.blob)) } }
-                  yield cols.zip(cells).to_h
-                end
-              when 7
-                live = false
-              when 3
-                msg = reading_reply { fr.text }
-                live = false
-                raise Skaidb.statement_error(msg)
-              else
-                # Mid-stream the server sends only RowsChunk, RowsEnd or Error.
-                # Anything else means we no longer know where the reply ends, so
-                # there is no draining back to a request boundary: retire it.
-                live = false
-                mark_broken!
-                raise QueryError, "unexpected frame in stream"
-              end
+            r = Reader.new(round_trip(req))
+          rescue ConnectionError
+            observe_failure
+            raise
+          end
+          @observer&.note_round_trip(self, Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+          tag = reading_reply { r.u8 }
+          placed = tag != 5 # every other reply is this one frame (an unknown one is retired below)
+          note_statement(sql) unless tag == 3
+          case tag
+          when 3
+            msg = reading_reply { r.text }
+            if msg.include?("unknown opcode")
+              what = params.empty? ? "streaming" : "parameterised streaming (skaidb >= 0.330)"
+              raise QueryError, "server does not support #{what}: #{msg}"
             end
-          ensure
+            raise Skaidb.statement_error(msg)
+          when 1
+            affected = reading_reply { r.u64 }
+            plain = Result.new(fields: [], rows: [], cmd_tuples: affected, kind: :mutation) # not row-producing
+          when 2
+            plain = Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
+          when 8
+            # ResultSets: a CALL whose body EMITted is answered with every set
+            # in ONE frame, streamed or not — the frame exec receives, decoded
+            # by the same code. Nothing follows it, so the rows are yielded
+            # below, with the connection free.
+            sets = reading_reply { parse_result_sets(r) }
+          when 5
+            # The server has already committed to a row stream, so from here
+            # the socket carries frames this call owns — mark it BEFORE
+            # parsing the header, not after. `Reader#take` raises on a
+            # truncated or absurd column count, and a raise between the
+            # commitment and the flag skips the drain entirely: nothing sets
+            # `@broken`, `usable?` stays true, and the pool files a socket
+            # parked mid-reply back for the next caller, who reads a leftover
+            # chunk and gets "unknown response tag 6". That is the very
+            # desync the ensure below exists to prevent.
+            live = true
+            reading = false
             begin
-              if reading
-                # Left while a frame was being read — the transport failed,
-                # or a Timeout, an Interrupt or Thread#kill cut the read
-                # short. The socket is not at a frame boundary (part of that
-                # frame may be consumed), so there is nothing to drain from;
-                # and draining would hold back the exception until the
-                # server had sent the rest of the stream, which a stalled
-                # server never does.
-                mark_broken!
-              elsif live && !@broken
-                # (A frame that could not be read has retired the socket
-                # already: there is no drain after it.)
-                drain_stream!
+              # Inside the begin, flags and header alike: from its first line
+              # the ensure below answers for the socket (+placed+), and a
+              # header that cannot be read leaves through it like every other
+              # way out of the stream.
+              placed = true
+              @streaming = true
+              @stream_fiber = Fiber.current
+              Skaidb.keep_stream_lock(@mutex)
+              cols = reading_reply { Array.new(r.u32) { r.text } }
+              summary = Result.new(fields: cols, rows: [], cmd_tuples: 0, kind: :stream)
+              while live
+                reading = true
+                frame = read_frame
+                reading = false
+                fr = Reader.new(frame)
+                case reading_reply { fr.u8 }
+                when 6
+                  reading_reply { fr.u32 }.times do
+                    cells = reading_reply { Array.new(fr.u32) { Skaidb.decode_value(Reader.new(fr.blob)) } }
+                    yield cols.zip(cells).to_h
+                  end
+                when 7
+                  live = false
+                when 3
+                  msg = reading_reply { fr.text }
+                  live = false
+                  raise Skaidb.statement_error(msg)
+                else
+                  # Mid-stream the server sends only RowsChunk, RowsEnd or Error.
+                  # Anything else means we no longer know where the reply ends, so
+                  # there is no draining back to a request boundary: retire it.
+                  live = false
+                  mark_broken!
+                  raise QueryError, "unexpected frame in stream"
+                end
               end
             ensure
-              # Cleared last: until this point the connection is mid-reply,
-              # and a caller who never unwinds here (an abandoned Enumerator
-              # Fiber) leaves it set, so usable? keeps reporting the truth.
-              # In an ensure of its own: a drain that is itself cut short
-              # has retired the socket, and the connection the next
-              # statement re-dials is not in the middle of any stream.
-              @streaming = false
-              @stream_fiber = nil
-              Skaidb.release_stream_lock(@mutex)
+              begin
+                if reading
+                  # Left while a frame was being read — the transport failed,
+                  # or a Timeout, an Interrupt or Thread#kill cut the read
+                  # short. The socket is not at a frame boundary (part of that
+                  # frame may be consumed), so there is nothing to drain from;
+                  # and draining would hold back the exception until the
+                  # server had sent the rest of the stream, which a stalled
+                  # server never does.
+                  mark_broken!
+                elsif live && !@broken
+                  # (A frame that could not be read has retired the socket
+                  # already: there is no drain after it.)
+                  drain_stream!
+                end
+              ensure
+                # Cleared last: until this point the connection is mid-reply,
+                # and a caller who never unwinds here (an abandoned Enumerator
+                # Fiber) leaves it set, so usable? keeps reporting the truth.
+                # In an ensure of its own: a drain that is itself cut short
+                # has retired the socket, and the connection the next
+                # statement re-dials is not in the middle of any stream.
+                @streaming = false
+                @stream_fiber = nil
+                Skaidb.release_stream_lock(@mutex)
+              end
             end
+          else
+            # Not a reply to a stream request: whether more frames follow it,
+            # and how many, cannot be told.
+            mark_broken!
+            raise QueryError, "unexpected response tag #{tag} to stream request"
           end
-        else
-          # Not a reply to a stream request: whether more frames follow it,
-          # and how many, cannot be told.
-          mark_broken!
-          raise QueryError, "unexpected response tag #{tag} to stream request"
+        ensure
+          mark_broken! unless placed
         end
-      ensure
-        mark_broken! unless placed
       end
+      return plain if plain
+
       if sets
         # What exec's Result yields (the call's final result, the LAST set),
         # and that same Result back, every set under +result_sets+.
@@ -1560,6 +1583,14 @@ module Skaidb
       # inside the helper would run the rest of the block, and the COMMIT, on
       # a new session with no transaction open: each statement autocommitted.
       raise ConnectionError, "connection lost inside a transaction; not re-dialling until it ends" if @in_transaction
+      # The same for a transaction the application opened itself: its
+      # statements, and its COMMIT, would each autocommit on a new session.
+      # It ends the transaction with ROLLBACK or COMMIT, neither of which is
+      # sent (see end_lost_transaction); then the connection re-dials.
+      if @transaction
+        raise ConnectionError, "connection lost inside a transaction: nothing of it was committed, and no " \
+                               "statement is sent until ROLLBACK (or COMMIT, which fails) ends it"
+      end
 
       @prepared.clear
       @held.clear
@@ -1842,39 +1873,138 @@ module Skaidb
 
     def run(sql, consistency)
       raise ConnectionError, "connection is closed" if @closed
-      ensure_live!
+      change = session_change(sql)
+      ended = end_lost_transaction(change)
+      return ended if ended
 
+      ensure_live!
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [1, consistency].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
-      reader = request(req)
-      res = parse_response(reader)
-      note_statement(sql)
-      note_use(sql)
-      res
+      following(change) do
+        res = parse_response(request(req))
+        note_statement(sql)
+        res
+      end
     end
 
     # +USE [DATABASE] <name>+ with an optional +;+ — the name bare, or in
     # double quotes with "" for a quote inside.
     USE_STATEMENT = /\A\s*USE\s+(?:DATABASE\s+)?("(?:[^"]|"")+"|[[:alpha:]_][[:alnum:]_]*)\s*;?\s*\z/i.freeze
+    # A statement whose first word is BEGIN: +BEGIN+, +BEGIN TRANSACTION+,
+    # +BEGIN ATOMIC …+.
+    BEGIN_STATEMENT = /\A\s*BEGIN(?![[:alnum:]_])/i.freeze
+    # Exactly +COMMIT [TRANSACTION]+ or +ROLLBACK [TRANSACTION]+, with an
+    # optional +;+.
+    END_STATEMENT = /\A\s*(COMMIT|ROLLBACK)(?:\s+TRANSACTION)?\s*;?\s*\z/i.freeze
     # A +--+ comment, which the server skips to the end of its line — or a
     # double-quoted name or single-quoted string, inside which two dashes are
     # not a comment (an unclosed quote runs to the end of the text).
     COMMENT_OR_QUOTED = /"[^"]*(?:"|\z)|'[^']*(?:'|\z)|--[^\n]*/.freeze
-    private_constant :USE_STATEMENT, :COMMENT_OR_QUOTED
+    private_constant :USE_STATEMENT, :BEGIN_STATEMENT, :END_STATEMENT, :COMMENT_OR_QUOTED
 
-    # A statement the server answered with success: when it is a USE, the
-    # session is in that database now, and a re-dial must put it back there
-    # (a new session starts in the default database, where a table of the
-    # same name is another table). Comments are skipped as the server skips
-    # them (+USE app -- the app database+). The name is kept as it was
-    # written and sent again the same way, in a USE of its own. Text that is
-    # not exactly one such statement is left alone.
-    def note_use(sql)
+    # What +sql+ changes of the session state the driver keeps a note of,
+    # as [kind, value] — or nil, for every other statement and for text
+    # that is not exactly one statement the driver can read:
+    #
+    # - [:use, name] — +USE [DATABASE] <name>+: the session moves to that
+    #   database. The name is kept as it was written.
+    # - [:begin, nil] — a statement whose first word is +BEGIN+: a
+    #   transaction opens.
+    # - [:commit, nil], [:rollback, nil] — it ends.
+    #
+    # Comments are skipped as the server skips them (+USE app -- the app
+    # database+). The note itself is taken once the server has answered
+    # (see following).
+    def session_change(sql)
       text = sql.gsub(COMMENT_OR_QUOTED) { |part| part.start_with?("--") ? "" : part }
-      m = USE_STATEMENT.match(text)
-      @session_use = m[1] if m
+      if (m = USE_STATEMENT.match(text)) then [:use, m[1]]
+      elsif BEGIN_STATEMENT.match?(text) then [:begin, nil]
+      elsif (m = END_STATEMENT.match(text)) then [m[1].downcase.to_sym, nil]
+      end
     rescue ArgumentError, EncodingError
-      nil # bytes the pattern cannot read
+      nil # bytes the patterns cannot read
+    end
+
+    # Runs the block — the round trip of a statement, and the reading of its
+    # reply — and brings the driver's notes in line with what the server
+    # answered. +change+ is what session_change read from the statement; nil
+    # is every ordinary statement, for which the block is simply run.
+    #
+    # - Success: the change is noted. After USE the session is in that
+    #   database, and a re-dial must put it back there (a new session starts
+    #   in the default database, where a table of the same name is another
+    #   table). After BEGIN a transaction is open, and until it ends a lost
+    #   connection is not replaced: PROTOCOL.md §6 rule 7 holds for a
+    #   transaction the application writes itself exactly as inside the
+    #   helper. After COMMIT or ROLLBACK it is over.
+    # - An Error from the server (QueryError): a USE or a BEGIN it refused
+    #   changed nothing. A COMMIT it refused has ended the transaction all
+    #   the same, and so has a ROLLBACK.
+    # - No answer the driver could read — the connection lost under the
+    #   statement, a reply that makes no sense, or an exception no statement
+    #   raised (a Timeout, an Interrupt) anywhere in between: whether the
+    #   server took the change is not known, so the notes cannot be trusted
+    #   to describe that session any more. The connection is marked broken:
+    #   the next statement re-dials into the state the notes do describe. A
+    #   COMMIT or ROLLBACK that ends this way has ended the transaction for
+    #   the driver — the server drops it with the socket — and a COMMIT
+    #   lost in transport says that its outcome is not known: the server may
+    #   have applied it before its reply went missing.
+    def following(change)
+      return yield if change.nil?
+
+      kind, value = change
+      ending = kind == :commit || kind == :rollback
+      settled = false
+      begin
+        result = yield
+        case kind
+        when :use then @session_use = value
+        when :begin then @transaction = true
+        else @transaction = false
+        end
+        settled = true
+        result
+      rescue QueryError
+        @transaction = false if ending
+        settled = true
+        raise
+      rescue ConnectionError => e
+        raise unless kind == :commit
+
+        raise ConnectionError, "connection lost under COMMIT: whether the transaction was committed is " \
+                               "not known (#{e.message})"
+      ensure
+        unless settled
+          mark_broken!
+          @transaction = false if ending
+        end
+      end
+    end
+
+    # The application ends a transaction whose connection is gone: its
+    # ROLLBACK is answered with success and its COMMIT with an error, and
+    # neither is sent — there is nothing to send them to. The server
+    # discarded the transaction with the connection, so nothing of it was
+    # committed (a COMMIT lost in flight is another matter, and following's).
+    # Either one clears the note; the next statement re-dials as after any
+    # lost connection. The connection is looked at first (lost_while_idle?):
+    # one found dead here is a lost transaction like any other.
+    #
+    # Returns nil when +change+ is no COMMIT or ROLLBACK, when no transaction
+    # is noted, or when its connection is alive: the statement is then sent.
+    def end_lost_transaction(change)
+      return nil unless @transaction && change && (change[0] == :commit || change[0] == :rollback)
+
+      mark_broken! if lost_while_idle?
+      return nil unless @broken
+
+      @transaction = false
+      if change[0] == :commit
+        raise ConnectionError, "connection lost inside a transaction: COMMIT was not sent and nothing was committed"
+      end
+
+      Result.new(fields: [], rows: [], cmd_tuples: 0, kind: :ddl)
     end
 
     # The request +stream+ sends. Without parameters: OP_QUERY_STREAM with

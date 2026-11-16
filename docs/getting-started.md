@@ -107,8 +107,10 @@ another writer changed a row the transaction writes raises
 `Skaidb::TransactionConflict` with nothing applied, and `transaction` then
 runs the block again (three runs in all by default), so the block must be
 safe to run more than once. On a cluster pass the opening statement:
-`conn.transaction(begin: "BEGIN ATOMIC") { |c| … }`. Details:
-[api.md](api.md#transactions).
+`conn.transaction(begin: "BEGIN ATOMIC") { |c| … }`. A transaction you
+write yourself (`exec("BEGIN")` … `exec("COMMIT")`) is followed by the
+driver too: if its connection is lost, nothing more is sent until your
+`ROLLBACK` or `COMMIT` ends it. Details: [api.md](api.md#transactions).
 
 ## Errors
 

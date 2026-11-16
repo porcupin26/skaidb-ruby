@@ -556,7 +556,7 @@ begin
   conn.exec_params("UPDATE accounts SET balance = balance + $1 WHERE id = $2", [10, 2])
 rescue StandardError
   begin
-    conn.exec("ROLLBACK") if conn.usable?
+    conn.exec("ROLLBACK")
   rescue Skaidb::Error
     nil                            # the clean-up never replaces the error it follows
   end
@@ -565,15 +565,34 @@ end
 conn.exec("COMMIT")                # Skaidb::TransactionConflict: nothing was applied; run it again from BEGIN
 ```
 
+The driver follows a transaction written this way: a statement the server
+accepted whose first word is `BEGIN` opens it, and `COMMIT [TRANSACTION]` or
+`ROLLBACK [TRANSACTION]` ends it once the server has answered, with success
+or with an error (sent with `exec`, `query`, `exec_params` or `stream`; `--`
+comments are skipped). While it is open **a lost connection is not
+replaced**, exactly as inside `transaction`: a new session has no
+transaction open, and the rest of the statements, and the `COMMIT`, would
+each be committed on their own there.
+
+- The statement under which the connection is lost raises
+  `Skaidb::ConnectionError`, and so does every statement after it; none is
+  sent.
+- `ROLLBACK` then succeeds without being sent — the server discarded the
+  transaction with the connection — and `COMMIT` raises `ConnectionError`
+  (`connection lost inside a transaction: COMMIT was not sent and nothing
+  was committed`). Either one ends the transaction for the driver; the next
+  statement re-dials as after any lost connection.
+- A connection lost under the `COMMIT` itself leaves the outcome unknown —
+  the server may have applied it before its reply went missing — and the
+  `ConnectionError` says so (`connection lost under COMMIT: whether the
+  transaction was committed is not known`).
+
 Two rules hold however the statements are sent:
 
 - **One connection for the whole transaction.** Statements sent on another
   connection are not part of it, so with a pool check one connection out
   (`pool.with`) and keep it until the `COMMIT`; a statement another thread
-  sends on that connection meanwhile is part of it. A `ConnectionError` ends
-  the transaction with its socket; the connection's next statement re-dials
-  and runs on a new session, in autocommit. That is why the example sends
-  `ROLLBACK` only while the connection is `usable?`.
+  sends on that connection meanwhile is part of it.
 - **Stop if `BEGIN` fails.** No transaction is open, so every statement sent
   after it would be committed on its own.
 
