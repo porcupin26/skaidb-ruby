@@ -613,6 +613,61 @@ class TransactionTest < Minitest::Test
     end
   end
 
+  # ---- the opening statement on a connection the server dropped ------------
+
+  def test_the_opening_statement_meets_a_restarted_server_as_any_statement_does
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(script)
+      plain = connect(srv)
+      c = connect(srv)
+      [plain, c].each { |conn| assert_equal 1, conn.exec("SELECT 1")[0]["c"] }
+      srv.close_all # the server restarts while both sit idle
+      # an ordinary statement: the one that meets the loss raises
+      # ConnectionError, the one after it re-dials
+      assert_raises(Skaidb::ConnectionError) { plain.exec("SELECT 1") }
+      assert_equal 1, plain.exec("SELECT 1")[0]["c"]
+      # the helper's opening statement is such a statement: the same
+      # ConnectionError, the block not run, nothing else sent ...
+      sent = statements(srv).length
+      runs = 0
+      assert_raises(Skaidb::ConnectionError) { c.transaction { |_tx| runs += 1 } }
+      assert_equal 0, runs
+      assert_equal sent, statements(srv).length
+      refute c.usable?
+      # ... and the next call re-dials: nothing is open yet, so BEGIN goes
+      # out on the new session and the transaction runs there
+      value = c.transaction do |tx|
+        runs += 1
+        tx.exec(DEBIT)
+        :done
+      end
+      assert_equal [:done, 1], [value, runs]
+      assert_equal ["BEGIN", DEBIT, "COMMIT"], statements(srv).last(3)
+      assert_equal 4, srv.connections # two dialled, two re-dialled
+      [plain, c].each(&:close)
+    end
+  end
+
+  def test_pool_transaction_meets_a_restarted_server_as_any_pooled_statement_does
+    with_server do |srv|
+      srv.handler = FakeSkaidb.scripted(script)
+      pool = Skaidb::Pool.new(host: "127.0.0.1", port: srv.port, user: "ada", password: "secret")
+      pool.with { |conn| conn.exec("SELECT 1") }
+      srv.close_all # the idle connection is gone, and looks fine from here
+      assert_raises(Skaidb::ConnectionError) { pool.with { |conn| conn.exec("SELECT 1") } }
+      assert_equal 1, pool.with { |conn| conn.exec("SELECT 1")[0]["c"] } # a new connection
+      srv.close_all
+      runs = 0
+      assert_raises(Skaidb::ConnectionError) { pool.transaction { |_conn| runs += 1 } }
+      assert_equal 0, runs
+      assert_equal :done, pool.transaction { |conn| conn.exec(DEBIT) && :done }
+      assert_equal ["BEGIN", DEBIT, "COMMIT"], statements(srv).last(3)
+      assert_equal 3, srv.connections
+      assert_equal [0, 1], pool.members[0].values_at(:in_use, :idle)
+      pool.close
+    end
+  end
+
   # ---- the pool ------------------------------------------------------------
 
   def test_pool_transaction_holds_one_connection_for_every_attempt_and_returns_it
