@@ -162,7 +162,10 @@ The database re-entered is the one the session was last in: `database:`, or
 the one a later `USE <name>` statement sent with `exec` moved it to. It is
 entered before anything else is sent on the new socket, and if the server
 refuses it the statement raises that error instead of running in another
-database.
+database. The one statement that does not wait for it is a `USE`: when the
+session's database is gone — dropped while the connection was down — a
+`USE` of another database is sent to the new session without the old one
+being entered first, so the connection can always be moved out of it.
 
 Session settings come back with it. The last `SET CONSISTENCY …` and the
 last `SET SCAN BUDGET …` the server accepted are sent again on the new

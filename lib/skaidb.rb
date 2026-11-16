@@ -822,6 +822,11 @@ module Skaidb
       # database does: a new connection starts without them.
       @session_consistency = nil
       @session_scan_budget = nil
+      # The socket was dialled for a USE statement, without entering the
+      # noted database first (see restore_session): until that USE is
+      # accepted its session is in the default database, not in the one
+      # the notes name, and carries nothing but a USE.
+      @unentered = false
       # Retained so a reconnect repeats the original connect exactly.
       @dial_args = { host: host, port: port, user: user, password: password,
                      timeout: timeout, database: database, tls: tls, tls_ca: tls_ca,
@@ -831,10 +836,12 @@ module Skaidb
       dial!
     end
 
-    # Connect, authenticate and enter the session database. Used for the first
+    # Connect, authenticate and restore the session. Used for the first
     # connect and for every reconnect, so a recovered connection is
-    # indistinguishable from a fresh one.
-    def dial!
+    # indistinguishable from a fresh one. +enter+ is false for the one dial
+    # that does not enter the session database: the re-dial a USE statement
+    # causes (see restore_session).
+    def dial!(enter: true)
       @serial = Skaidb.next_dial_serial
       host = @dial_args[:host]
       port = @dial_args[:port]
@@ -901,7 +908,7 @@ module Skaidb
               "no reachable endpoint in #{endpoints.map { |(h, q)| "#{h}:#{q}" }.join(', ')}: #{last.message}"
       end
       send_hello
-      restore_session
+      restore_session(enter)
     end
 
     # What a session is besides its socket, put back on a new one before
@@ -916,8 +923,17 @@ module Skaidb
     # If the server refuses one of them the dial has failed, and its error
     # is the statement's: nothing runs in another database, or under other
     # settings than the application set.
-    def restore_session
-      session_statement("USE #{@session_use}") if @session_use
+    #
+    # With one exception. When the statement that caused the re-dial is
+    # itself a USE (+enter_database+ false), the database it leaves is not
+    # entered first. That database may be gone — dropped while the
+    # connection was down — and every statement then fails at this USE, as
+    # it must; a USE of another database is the application's way out, and
+    # must not fail at it too. The settings are put back, the USE is sent,
+    # and its answer decides the session database as usual (see following).
+    def restore_session(enter_database)
+      @unentered = !enter_database && !@session_use.nil?
+      session_statement("USE #{@session_use}") if @session_use && enter_database
       session_statement(@session_consistency) if @session_consistency
       session_statement(@session_scan_budget) if @session_scan_budget
     end
@@ -1274,7 +1290,7 @@ module Skaidb
       ended = end_lost_transaction(change)
       return ended if ended
 
-      ensure_live!
+      ensure_live!(entering: !change.nil? && change[0] == :use)
 
       live = false
       summary = nil
@@ -1596,17 +1612,23 @@ module Skaidb
 
     # Re-dial if the transport died since the last statement — or while the
     # connection sat idle, which is looked for here (lost_while_idle?) —
-    # BEFORE anything is written or prepared on it.
+    # BEFORE anything is written or prepared on it. +entering+ says the
+    # statement about to be sent is a USE: a re-dial for it does not enter
+    # the database the session is leaving (see restore_session).
     #
     # The prepared-statement cache MUST be cleared: an id is only valid on the
     # connection that created it, so carrying one across a reconnect would run
     # a different statement (or fail obscurely).
-    def ensure_live!
+    def ensure_live!(entering: false)
       raise ConnectionError, "connection is closed" if @closed
       # Found dead before the request is written: exactly as after a failed
       # write, except that nothing was sent — so nothing is reported, and
       # the statement goes out on the connection dialled below.
       mark_broken! if lost_while_idle?
+      # A socket dialled for a USE that then never reached it (the call was
+      # cut short in between) is in the default database: only a USE may
+      # use it, and anything else dials again.
+      mark_broken! if @unentered && !entering
       return unless @broken
       # A transaction lives on the socket that carried its BEGIN. Re-dialling
       # inside the helper would run the rest of the block, and the COMMIT, on
@@ -1634,7 +1656,7 @@ module Skaidb
       @broken = false
       dialled = false
       begin
-        dial!
+        dial!(enter: !entering)
         dialled = true
       ensure
         # Still down, so the next statement retries — or the dial was cut
@@ -1906,7 +1928,7 @@ module Skaidb
       ended = end_lost_transaction(change)
       return ended if ended
 
-      ensure_live!
+      ensure_live!(entering: !change.nil? && change[0] == :use)
       sql_bytes = sql.dup.force_encoding("UTF-8").b
       req = [1, consistency].pack("CC") + [sql_bytes.bytesize].pack("V") + sql_bytes
       following(change) do
@@ -1982,7 +2004,9 @@ module Skaidb
     #   transaction the application writes itself exactly as inside the
     #   helper. After COMMIT or ROLLBACK it is over.
     # - An Error from the server (QueryError): a USE, a SET or a BEGIN it
-    #   refused changed nothing. A COMMIT it refused has ended the transaction all
+    #   refused changed nothing. (A USE refused on a socket dialled for it
+    #   leaves that socket in no database the driver noted: it is retired,
+    #   and the next statement dials into the noted one again.) A COMMIT it refused has ended the transaction all
     #   the same, and so has a ROLLBACK.
     # - No answer the driver could read — the connection lost under the
     #   statement, a reply that makes no sense, or an exception no statement
@@ -2003,7 +2027,9 @@ module Skaidb
       begin
         result = yield
         case kind
-        when :use then @session_use = value
+        when :use
+          @session_use = value
+          @unentered = false
         when :consistency then @session_consistency = value
         when :scan_budget then @session_scan_budget = value
         when :begin then @transaction = true
@@ -2013,6 +2039,10 @@ module Skaidb
         result
       rescue QueryError
         @transaction = false if ending
+        # A USE the server refused, on a socket that was dialled for it
+        # without entering the noted database: its session is in the
+        # default database, where nothing the application sends belongs.
+        mark_broken! if @unentered
         settled = true
         raise
       rescue ConnectionError => e

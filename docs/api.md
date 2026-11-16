@@ -235,7 +235,16 @@ bare or double-quoted, an optional trailing `;`, `--` comments skipped as
 the server skips them; the name is kept as it was written and sent again
 in a `USE` of its own). It is entered before anything else is sent, and a refusal is
 raised to the statement that caused the re-dial — which is not sent — so no
-statement runs in another database.
+statement runs in another database. When that statement is itself a `USE`
+the driver can read, the database the session is leaving is not entered
+first: the settings are put back and the `USE` is sent, and its answer
+decides the session database as usual. A session whose database was
+dropped while its connection was down fails every statement with the
+`USE`'s error (`database "app" does not exist`), and is moved out of it
+with a `USE` of another database. A `USE` that this new session refuses
+leaves it in no database the application chose, so it is closed: the next
+statement dials again and fails as before, rather than running in the
+default database.
 
 The settings are the last `SET CONSISTENCY …` and the last
 `SET SCAN BUDGET …` statement the server accepted (from the same four
