@@ -756,7 +756,12 @@ module Skaidb
       # The transaction helper is between its BEGIN and its COMMIT/ROLLBACK,
       # so a lost socket must not be re-dialled (see ensure_live!).
       @in_transaction = false
+      # Statements prepared on this socket, SQL => [id, nparams]: the ones
+      # the driver prepared for exec_params / exec_batch, least recently used
+      # first, and the ones prepare_server handed to the application (see
+      # prepare_cached).
       @prepared = {}
+      @held = {}
       @last_prepare_error = nil
       # The session database, as the USE target every dial re-enters: the one
       # the connection was opened in (+database:+), and the one it is in now
@@ -918,7 +923,7 @@ module Skaidb
         # and Hashes have no SQL literal form. $N is rewritten to the
         # positional ? the server expects.
         qsql, order = Skaidb.to_qmark(sql.to_s, params)
-        prep = prepare_server(qsql)
+        prep = prepare_cached(qsql)
         unless prep.nil?
           id, nparams = prep
           if nparams != order.length
@@ -951,7 +956,7 @@ module Skaidb
 
       level = consistency.nil? ? @consistency : Consistency.resolve(consistency)
       qsql, = Skaidb.to_qmark(sql.to_s, rows.first)
-      prep = prepare_server(qsql)
+      prep = prepare_cached(qsql)
       raise QueryError, "statement cannot be prepared, so it cannot be batched" if prep.nil?
 
       id, nparams = prep
@@ -1255,36 +1260,19 @@ module Skaidb
     end
 
     # Prepare +sql+ on the SERVER, returning [id, nparams], or nil when the
-    # server declines the statement kind (DDL, session statements) so the
-    # caller falls back to text binding. Cached per connection.
+    # server declines the statement kind (DDL, session statements). The id is
+    # the caller's to keep for exec_prepared: the driver's cache never closes
+    # a statement handed out here (exec_params and exec_batch with the same
+    # SQL use it too). A server whose statement table is full refuses with
+    # QueryError.
     def prepare_server(sql)
-      raise ConnectionError, "connection is closed" if @closed
-      # Before the cache is read: a re-dial empties it, and a cached id must
-      # not send a statement down a socket that is broken.
-      ensure_live!
-      hit = @prepared[sql]
-      return hit if hit
-
-      sql_bytes = sql.dup.force_encoding("UTF-8").b
-      req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
-      reader = request(req)
-      tag = reader.u8
-      case tag
-      when 4
-        id = reader.u32
-        nparams = reader.u16
-        v = [id, nparams]
-        @prepared[sql] = v if @prepared.length < 240
-        v
-      when 3
-        # Refused: DDL/session statements cannot be prepared, and an old
-        # server answers "unknown opcode". Kept for the caller's error message.
-        @last_prepare_error = reader.text
-        nil
-      else
-        raise QueryError, "unexpected prepare response tag #{tag}"
-      end
+      prepare_cached(sql, hold: true)
     end
+
+    # The server holds at most 256 prepared statements per connection
+    # (PROTOCOL.md §3.3). The driver keeps under it with room to spare.
+    PREPARED_LIMIT = 240
+    private_constant :PREPARED_LIMIT
 
     # Execute a prepared statement with TYPED parameters. The id belongs to
     # the socket that prepared it, so a broken connection is not re-dialled
@@ -1412,6 +1400,7 @@ module Skaidb
       raise ConnectionError, "connection lost inside a transaction; not re-dialling until it ends" if @in_transaction
 
       @prepared.clear
+      @held.clear
       begin
         @sock&.close
       rescue StandardError
@@ -1547,6 +1536,65 @@ module Skaidb
     end
 
     # -- query --
+
+    # prepare_server's work, and how exec_params and exec_batch prepare: [id,
+    # nparams] for +sql+, from this socket's statements or prepared now; nil
+    # when the server declines the statement kind, so the caller falls back
+    # to text binding.
+    #
+    # Statements prepared here on the driver's own account are a cache, least
+    # recently used first. Before a new statement would take the count to
+    # PREPARED_LIMIT the oldest of them is closed on the server (OP_CLOSE),
+    # so the server's table (256 per connection) never fills however many
+    # distinct statements a connection runs. Statements handed to the
+    # application (+hold+) are never closed: it still holds their ids.
+    #
+    # A server that refuses because its table is full all the same — the
+    # application holds that many — is a statement error, QueryError. It is
+    # NOT answered with the text fallback: that would send the values as
+    # literals, a Time as a number and bytes as a hex string, without a word.
+    def prepare_cached(sql, hold: false)
+      raise ConnectionError, "connection is closed" if @closed
+      # Before the cache is read: a re-dial empties it, and a cached id must
+      # not send a statement down a socket that is broken.
+      ensure_live!
+      hit = @held[sql]
+      return hit if hit
+
+      if (hit = @prepared.delete(sql))
+        (hold ? @held : @prepared)[sql] = hit # held from now on, or most recently used
+        return hit
+      end
+
+      close_prepared(@prepared.shift[1][0]) while @held.length + @prepared.length >= PREPARED_LIMIT && !@prepared.empty?
+      sql_bytes = sql.dup.force_encoding("UTF-8").b
+      req = [2].pack("C") + [sql_bytes.bytesize].pack("V") + sql_bytes
+      reader = request(req)
+      tag = reader.u8
+      case tag
+      when 4
+        id = reader.u32
+        nparams = reader.u16
+        (hold ? @held : @prepared)[sql] = [id, nparams]
+      when 3
+        msg = reader.text
+        raise Skaidb.statement_error(msg) if msg.start_with?("too many prepared statements")
+
+        # Refused: DDL/session statements cannot be prepared, and an old
+        # server answers "unknown opcode". Kept for the caller's error message.
+        @last_prepare_error = msg
+        nil
+      else
+        raise QueryError, "unexpected prepare response tag #{tag}"
+      end
+    end
+
+    # Free a prepared statement's slot on the server (OP_CLOSE). What it
+    # answers does not matter: the id is forgotten here either way.
+    def close_prepared(id)
+      request([4].pack("C") + [id].pack("V"))
+      nil
+    end
 
     # The transaction helper's clean-up after a block that did not run to its
     # end. It runs while something else is unwinding, so it never raises: a

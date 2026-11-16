@@ -42,8 +42,10 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   sending the values typed. Falls back to client-side text binding when the
   server refuses to prepare the statement (DDL, `USE`, old servers); on that
   path an Array/Hash parameter raises `QueryError` that includes the server's
-  refusal reason. `consistency:` overrides the connection default for this
-  statement.
+  refusal reason. A server that refuses because its statement table is full
+  (`too many prepared statements …`) is not answered with that fallback: the
+  `QueryError` is raised. `consistency:` overrides the connection default
+  for this statement.
 - `exec_batch(sql, rows, consistency: nil) → Integer` — prepare once, execute
   once per row in one frame, return the total affected count. `rows` is an
   Array of parameter Arrays. An empty `rows` returns `0` with no round-trip.
@@ -56,8 +58,15 @@ Raises `Skaidb::Error` before dialing for an unknown `auth_mechanism`, a
   this raises `ConnectionError` instead of re-dialing, and `prepare_server`
   hands out a new id.
 - `prepare_server(sql) → [id, nparams] | nil` — prepare a statement with `?`
-  placeholders on the server; `nil` when the server refuses. Cached per
-  connection (240 entries); the cache is cleared on re-dial.
+  placeholders on the server; `nil` when the server declines the statement
+  kind, `QueryError` when its statement table is full. The id is yours to
+  keep for `exec_prepared`: the driver never closes a statement it handed
+  out here, and `exec_params`/`exec_batch` with the same SQL reuse it. The
+  statements the driver prepares itself for `exec_params` and `exec_batch`
+  are a cache of the least recently used, closed on the server (`OP_CLOSE`)
+  as they leave it, so that held and cached statements together stay at 240
+  — under the server's 256 per connection. Everything is forgotten on
+  re-dial.
 - `stream(sql, params = [], consistency: nil) { |row| … } → Result` — see
   [streaming.md](streaming.md). `params` (an Array) bind `$1`, `$2`, …
   exactly as `exec_params` binds them, typed, over `OP_QUERY_STREAM_PARAMS`

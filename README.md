@@ -243,9 +243,12 @@ conn.exec_params("INSERT INTO docs (id, meta) VALUES ($1, $2)",
 conn.exec_params("SELECT id FROM users WHERE id IN ($1)", [[1, 2, 3]])   # set membership
 ```
 
-Prepared statements are cached per connection (up to 240 entries, under the
-server's 256-per-connection limit) and reused. The cache is dropped when the
-connection re-dials.
+Prepared statements are cached per connection and reused. The server holds
+at most 256 per connection, so the cache keeps to 240: before a new statement
+would exceed that, the least recently used one is closed on the server. A
+connection can therefore run any number of distinct parameterised statements,
+every one with typed values. The cache is dropped when the connection
+re-dials.
 
 Statement kinds the server refuses to prepare (DDL and session control such
 as `USE`) fall back to **client-side text binding** for scalar parameters: a
